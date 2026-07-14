@@ -94,6 +94,12 @@ class CampaignManifest(BaseModel):
     narration: str = Field(min_length=1)
     duration_seconds: int = Field(ge=1)
     destinations: list[Destination] = Field(min_length=1)
+    platform_overrides: dict[Destination, dict[str, object]] = Field(
+        default_factory=dict
+    )
+    hashtags: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    synthetic_media: bool = False
     timezone: str = Field(min_length=1)
     schedule: list[datetime]
     daily_cap: int = Field(ge=1)

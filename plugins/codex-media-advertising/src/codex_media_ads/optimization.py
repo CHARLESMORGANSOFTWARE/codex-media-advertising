@@ -3,16 +3,17 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 from pydantic import BaseModel, Field
 
-from .models import CampaignManifest
+from .models import CampaignManifest, Destination
 
 
 POLICY_PATH = Path(__file__).with_name("policies") / "platforms.v1.json"
+DESTINATIONS: frozenset[str] = frozenset(get_args(Destination))
 FILENAME_SLUG = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9._-]*\.(?:avi|gif|jpe?g|m4v|mov|mp4|png|webm)$",
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*\.[A-Za-z0-9]+$",
     re.IGNORECASE,
 )
 
@@ -57,11 +58,25 @@ def _load_policies() -> dict[str, Any]:
     policies = json.loads(POLICY_PATH.read_text())
     if not isinstance(policies, dict) or not isinstance(policies.get("version"), str):
         raise ValueError("platform policy file is invalid")
+    platform_keys = {
+        key for key, value in policies.items() if isinstance(value, dict)
+    }
+    if platform_keys != DESTINATIONS:
+        raise ValueError(
+            "platform keys must be exactly: "
+            + ", ".join(sorted(DESTINATIONS))
+        )
     return policies
 
 
 def _campaign_value(campaign: CampaignManifest, field: str, default: object) -> object:
     return getattr(campaign, field, default)
+
+
+def _contains_phrase(copy: str, phrase: str) -> bool:
+    return re.search(
+        rf"(?<!\w){re.escape(phrase)}(?!\w)", copy, re.IGNORECASE
+    ) is not None
 
 
 def _append_required_calls_to_action(
@@ -70,7 +85,7 @@ def _append_required_calls_to_action(
     target = "description" if platform == "youtube" else "caption"
     copy = str(metadata[target])
     for call_to_action in _normalize_list(campaign.calls_to_action):
-        if call_to_action.casefold() not in copy.casefold():
+        if not _contains_phrase(copy, call_to_action):
             copy = f"{copy} {call_to_action}".strip()
     metadata[target] = copy
 

@@ -123,6 +123,33 @@ def test_manifest_rejects_unknown_fields(example_campaign: Path):
         CampaignManifest.model_validate(data)
 
 
+def test_load_campaign_accepts_typed_optimization_fields(
+    example_campaign: Path, tmp_path: Path
+):
+    data = json.loads(example_campaign.read_text())
+    data.update(
+        {
+            "platform_overrides": {
+                "instagram": {"caption": "A platform-specific caption"}
+            },
+            "hashtags": ["#Launch"],
+            "tags": ["launch"],
+            "synthetic_media": True,
+        }
+    )
+    path = tmp_path / "campaign.json"
+    path.write_text(json.dumps(data))
+
+    campaign = load_campaign(path)
+
+    assert campaign.platform_overrides == {
+        "instagram": {"caption": "A platform-specific caption"}
+    }
+    assert campaign.hashtags == ["#Launch"]
+    assert campaign.tags == ["launch"]
+    assert campaign.synthetic_media is True
+
+
 def test_manifest_requires_confirmed_rights(example_campaign: Path):
     data = json.loads(example_campaign.read_text())
     data["rights_confirmed"] = False
