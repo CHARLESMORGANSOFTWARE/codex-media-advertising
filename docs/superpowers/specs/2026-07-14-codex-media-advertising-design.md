@@ -46,44 +46,47 @@ The public repository must not include:
 
 ```text
 codex-media-advertising/
-├── .codex-plugin/plugin.json
+├── .agents/plugins/marketplace.json
 ├── .github/workflows/ci.yml
-├── assets/
 ├── docs/
-│   ├── installation.md
-│   ├── authentication.md
-│   ├── automations.md
-│   ├── platform-notes.md
 │   └── superpowers/
-├── examples/
-│   ├── brand.example.json
-│   ├── campaign.example.json
-│   └── schedule.example.json
-├── skills/
-│   ├── media-campaign/
-│   ├── media-onboarding/
-│   ├── media-automation/
-│   ├── media-publishing/
-│   └── media-operations/
-├── src/codex_media_ads/
-│   ├── cli.py
-│   ├── config.py
-│   ├── manifests.py
-│   ├── optimization.py
-│   ├── creative/
-│   ├── queueing/
-│   ├── publishing/
-│   └── automation/
-├── tests/
-├── scripts/install.sh
-├── scripts/uninstall.sh
-├── pyproject.toml
+├── plugins/codex-media-advertising/
+│   ├── .codex-plugin/plugin.json
+│   ├── assets/
+│   ├── docs/
+│   │   ├── installation.md
+│   │   ├── authentication.md
+│   │   ├── automations.md
+│   │   └── platform-notes.md
+│   ├── examples/
+│   │   ├── brand.example.json
+│   │   ├── campaign.example.json
+│   │   └── schedule.example.json
+│   ├── skills/
+│   │   ├── media-campaign/
+│   │   ├── media-onboarding/
+│   │   ├── media-automation/
+│   │   ├── media-publishing/
+│   │   └── media-operations/
+│   ├── src/codex_media_ads/
+│   │   ├── cli.py
+│   │   ├── config.py
+│   │   ├── manifests.py
+│   │   ├── optimization.py
+│   │   ├── creative/
+│   │   ├── queueing/
+│   │   ├── publishing/
+│   │   └── automation/
+│   ├── tests/
+│   ├── scripts/install.sh
+│   ├── scripts/uninstall.sh
+│   └── pyproject.toml
 ├── README.md
 ├── LICENSE
 └── NOTICE
 ```
 
-The plugin manifest discovers the five skills. The Python package installs the `codex-media-ads` command used by both humans and Codex automations.
+The repository is a team marketplace that can be cloned from GitHub and added to Codex. Its marketplace entry points to the nested plugin. The plugin manifest discovers the five skills, and the nested Python package installs the `codex-media-ads` command used by both humans and Codex automations.
 
 ## Configuration and State
 
@@ -264,7 +267,7 @@ The README provides a short path:
 
 1. Clone the public GitHub repository.
 2. Run `./scripts/install.sh`.
-3. Install the repository marketplace/plugin in Codex using the documented plugin command.
+3. Add the cloned repository as a Codex marketplace and install `codex-media-advertising` from it using the documented plugin commands.
 4. Start a new Codex task and invoke `$media-onboarding`.
 5. Complete account authentication, dry runs, and automation creation.
 
