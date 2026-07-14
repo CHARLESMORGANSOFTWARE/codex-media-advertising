@@ -1,0 +1,267 @@
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Iterable, Protocol, Sequence
+
+from ..config import PRIVATE_MODES, SECRET_FILE_MODE
+
+
+_EXCLUDED_DIRECTORIES = {
+    "cache",
+    "code cache",
+    "gpucache",
+    "grshadercache",
+    "shadercache",
+    "dawncache",
+    "cachestorage",
+    "scriptcache",
+    "crashpad",
+}
+_EXCLUDED_FILES = {"lock", "lockfile"}
+
+
+def _excluded(path: Path) -> bool:
+    name = path.name
+    lowered = name.casefold()
+    if path.is_symlink():
+        return True
+    if lowered in _EXCLUDED_DIRECTORIES:
+        return True
+    if lowered in _EXCLUDED_FILES or lowered.endswith(".lock"):
+        return True
+    if lowered.startswith("singleton"):
+        return True
+    return False
+
+
+def _copy_profile_tree(source: Path, destination: Path) -> None:
+    destination.mkdir(mode=PRIVATE_MODES, parents=True, exist_ok=False)
+    destination.chmod(PRIVATE_MODES)
+    for entry in source.iterdir():
+        if _excluded(entry):
+            continue
+        target = destination / entry.name
+        if entry.is_dir():
+            _copy_profile_tree(entry, target)
+        elif entry.is_file():
+            shutil.copyfile(entry, target, follow_symlinks=False)
+            target.chmod(SECRET_FILE_MODE)
+
+
+def clone_profile(profile_source: Path, destination: Path, *, profile_name: str) -> Path:
+    """Copy auth-bearing Chrome state without transient caches or runtime locks."""
+
+    if not profile_name or Path(profile_name).name != profile_name or profile_name in {".", ".."}:
+        raise ValueError("profile name must be one directory name")
+    source_root = Path(profile_source).expanduser().resolve(strict=True)
+    destination = Path(destination).expanduser().resolve()
+    if _is_within(destination, source_root):
+        raise ValueError("profile clone destination must remain outside the source")
+    if destination.exists() and any(destination.iterdir()):
+        raise FileExistsError(f"profile clone destination is not empty: {destination}")
+    local_state = source_root / "Local State"
+    selected_profile = source_root / profile_name
+    if local_state.is_symlink() or not local_state.is_file():
+        raise FileNotFoundError(f"Chrome Local State is unavailable: {local_state}")
+    if selected_profile.is_symlink() or not selected_profile.is_dir():
+        raise FileNotFoundError(f"Chrome profile is unavailable: {selected_profile}")
+
+    destination.mkdir(mode=PRIVATE_MODES, parents=True, exist_ok=True)
+    destination.chmod(PRIVATE_MODES)
+    shutil.copyfile(local_state, destination / "Local State", follow_symlinks=False)
+    (destination / "Local State").chmod(SECRET_FILE_MODE)
+    _copy_profile_tree(selected_profile, destination / profile_name)
+    return destination
+
+
+@dataclass(frozen=True)
+class ProcessRecord:
+    pid: int
+    parent_pid: int
+    command: str
+
+
+def _system_process_table() -> list[ProcessRecord]:
+    completed = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,command="],
+        check=False,
+        capture_output=True,
+        text=True,
+        shell=False,
+    )
+    records: list[ProcessRecord] = []
+    for line in completed.stdout.splitlines():
+        parts = line.strip().split(maxsplit=2)
+        if len(parts) != 3:
+            continue
+        try:
+            records.append(ProcessRecord(int(parts[0]), int(parts[1]), parts[2]))
+        except ValueError:
+            continue
+    return records
+
+
+def _matching_processes(records: Iterable[ProcessRecord], clone_root: Path) -> set[int]:
+    records = tuple(records)
+    marker = f"--user-data-dir={clone_root.resolve()}"
+    marker_pattern = re.compile(
+        rf"(?:(?<=[\s'\"])|^){re.escape(marker)}(?=[\s'\"]|$)"
+    )
+    roots = {
+        record.pid for record in records if marker_pattern.search(record.command) is not None
+    }
+    family = set(roots)
+    changed = True
+    while changed:
+        changed = False
+        for record in records:
+            if record.parent_pid in family and record.pid not in family:
+                family.add(record.pid)
+                changed = True
+    return family
+
+
+class PopenLike(Protocol):
+    pid: int
+
+    def poll(self) -> int | None: ...
+
+
+@dataclass
+class ManagedChrome:
+    process: PopenLike
+    clone_root: Path
+    port: int
+    log_path: Path
+    process_table: Callable[[], Iterable[ProcessRecord]] = _system_process_table
+    kill: Callable[[int, int], None] = os.kill
+    sleep: Callable[[float], None] = time.sleep
+    monotonic: Callable[[], float] = time.monotonic
+    _log_handle: object | None = field(default=None, repr=False)
+    _closed: bool = field(default=False, init=False, repr=False)
+
+    @property
+    def cdp_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def _signal(self, pids: Iterable[int], value: int) -> None:
+        for pid in sorted(set(pids), reverse=True):
+            try:
+                self.kill(pid, value)
+            except ProcessLookupError:
+                continue
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        matching = _matching_processes(self.process_table(), self.clone_root)
+        self._signal(matching, signal.SIGTERM)
+        deadline = self.monotonic() + 5.0
+        remaining = matching
+        while remaining and self.monotonic() < deadline:
+            self.sleep(0.1)
+            remaining = _matching_processes(self.process_table(), self.clone_root)
+        if remaining:
+            remaining = _matching_processes(self.process_table(), self.clone_root)
+            self._signal(remaining, signal.SIGKILL)
+        if self._log_handle is not None:
+            close = getattr(self._log_handle, "close", None)
+            if close is not None:
+                close()
+
+    def __enter__(self) -> ManagedChrome:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+def _loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def _is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def launch_chrome(
+    *,
+    chrome_path: Path,
+    profile_source: Path,
+    profile_name: str,
+    state_root: Path,
+    extra_args: Sequence[str] = (),
+    popen: Callable[..., PopenLike] = subprocess.Popen,
+) -> ManagedChrome:
+    """Launch a single isolated Chrome run using only private state-owned paths."""
+
+    managed_prefixes = (
+        "--user-data-dir",
+        "--profile-directory",
+        "--remote-debugging-address",
+        "--remote-debugging-port",
+    )
+    if any(str(argument).startswith(managed_prefixes) for argument in extra_args):
+        raise ValueError("extra_args contains a managed Chrome argument")
+    state_root = Path(state_root).expanduser().resolve()
+    state_root.mkdir(mode=PRIVATE_MODES, parents=True, exist_ok=True)
+    state_root.chmod(PRIVATE_MODES)
+    run_id = uuid.uuid4().hex
+    clone_root = (state_root / "browser-profiles" / f"run-{run_id}").resolve()
+    logs_root = (state_root / "logs" / "chrome").resolve()
+    if not _is_within(clone_root, state_root) or not _is_within(logs_root, state_root):
+        raise ValueError("Chrome run paths must remain inside private state")
+    logs_root.mkdir(mode=PRIVATE_MODES, parents=True, exist_ok=True)
+    logs_root.chmod(PRIVATE_MODES)
+    clone_profile(profile_source, clone_root, profile_name=profile_name)
+
+    port = _loopback_port()
+    log_path = logs_root / f"run-{run_id}.log"
+    log_fd = os.open(log_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, SECRET_FILE_MODE)
+    log_handle = os.fdopen(log_fd, "wb", buffering=0)
+    argv = [
+        str(Path(chrome_path).expanduser()),
+        f"--user-data-dir={clone_root}",
+        f"--profile-directory={profile_name}",
+        "--remote-debugging-address=127.0.0.1",
+        f"--remote-debugging-port={port}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        *extra_args,
+    ]
+    try:
+        process = popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            shell=False,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except BaseException:
+        log_handle.close()
+        raise
+    return ManagedChrome(
+        process=process,
+        clone_root=clone_root,
+        port=port,
+        log_path=log_path,
+        _log_handle=log_handle,
+    )
