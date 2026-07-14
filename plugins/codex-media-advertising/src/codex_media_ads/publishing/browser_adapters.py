@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from importlib import import_module
 from importlib.resources import files
@@ -25,6 +26,7 @@ from .base import (
     ValidationResult,
     normalize_adapter_error,
     probe_identity,
+    redact_diagnostic,
 )
 from .chrome import ManagedChrome
 
@@ -212,43 +214,37 @@ _PLATFORM_LOCATORS = {
     "threads": _COMMON_LOCATORS | {"create"},
 }
 _SCHEDULE_PLATFORMS = {"tiktok", "youtube", "facebook"}
-_PLATFORM_OPERATIONS = {
-    "instagram": {
-        "before_probe": [],
-        "before_upload": ["create"],
-        "after_upload": ["advance", "advance"],
-        "after_metadata": [],
-    },
-    "tiktok": {
-        "before_probe": [],
-        "before_upload": [],
-        "after_upload": [],
-        "after_metadata": [],
-    },
-    "youtube": {
-        "before_probe": ["identity_menu"],
-        "before_upload": ["create", "upload_videos"],
-        "after_upload": [],
-        "after_metadata": ["wizard_next", "wizard_next", "wizard_next"],
-    },
-    "x": {
-        "before_probe": [],
-        "before_upload": [],
-        "after_upload": ["processing"],
-        "after_metadata": [],
-    },
-    "facebook": {
-        "before_probe": [],
-        "before_upload": [],
-        "after_upload": [],
-        "after_metadata": [],
-    },
-    "threads": {
-        "before_probe": [],
-        "before_upload": ["create"],
-        "after_upload": [],
-        "after_metadata": [],
-    },
+
+
+@dataclass(frozen=True)
+class _BrowserFlowPlan:
+    """Ordered controls that move one platform between publishing phases."""
+
+    probe: tuple[str, ...] = ()
+    open_upload: tuple[str, ...] = ()
+    after_upload: tuple[str, ...] = ()
+    after_details: tuple[str, ...] = ()
+
+
+_PLATFORM_FLOWS = {
+    "instagram": _BrowserFlowPlan(
+        open_upload=("create",), after_upload=("advance", "advance")
+    ),
+    "tiktok": _BrowserFlowPlan(),
+    "youtube": _BrowserFlowPlan(
+        probe=("identity_menu",),
+        open_upload=("create", "upload_videos"),
+        after_details=("wizard_next", "wizard_next", "wizard_next"),
+    ),
+    "x": _BrowserFlowPlan(after_upload=("processing",)),
+    "facebook": _BrowserFlowPlan(),
+    "threads": _BrowserFlowPlan(open_upload=("create",)),
+}
+_FLOW_CONFIG_FIELDS = {
+    "probe_operations": "probe",
+    "open_upload_operations": "open_upload",
+    "after_upload_operations": "after_upload",
+    "after_details_operations": "after_details",
 }
 _GENERIC_LOGGED_OUT = re.compile(r"\b(?:log\s*in|sign\s*in)\b", re.IGNORECASE)
 _GENERIC_IDENTITIES = {
@@ -266,10 +262,7 @@ _BASE_PLATFORM_FIELDS = {
     "identity_evidence",
     "confirmation_pattern",
     "platform_id_pattern",
-    "before_probe",
-    "before_upload",
-    "after_upload",
-    "after_metadata",
+    *_FLOW_CONFIG_FIELDS,
     "locators",
 }
 _SCHEDULE_PLATFORM_FIELDS = {
@@ -369,9 +362,10 @@ def _validate_selector_data(data: object) -> dict[str, object]:
             )
         for purpose, raw_locator in locators.items():
             _validate_locator(platform, str(purpose), raw_locator)
-        for key in ("before_probe", "before_upload", "after_upload", "after_metadata"):
+        flow = _PLATFORM_FLOWS[platform]
+        for key, phase in _FLOW_CONFIG_FIELDS.items():
             sequence = raw_config.get(key, [])
-            if sequence != _PLATFORM_OPERATIONS[platform][key]:
+            if sequence != list(getattr(flow, phase)):
                 raise ValueError(
                     f"{platform} {key} operations must match the intended sequence"
                 )
@@ -466,6 +460,33 @@ class _SharedManagedRuntime:
             self._chrome.close()
 
 
+def _cleanup_failed_browser_setup(
+    original: BaseException,
+    chrome: ManagedChrome,
+    pages: tuple[BrowserPage, ...] = (),
+) -> None:
+    """Clean partial setup without replacing its decisive exception."""
+
+    diagnostics: list[str] = []
+    for index, page in enumerate(reversed(pages), start=1):
+        close_page = getattr(page, "close", None)
+        if callable(close_page):
+            try:
+                close_page()
+            except Exception as cleanup_error:
+                diagnostics.append(
+                    f"page[{index}]={redact_diagnostic(str(cleanup_error))}"
+                )
+    try:
+        chrome.close()
+    except Exception as cleanup_error:
+        diagnostics.append(
+            f"managed_chrome={redact_diagnostic(str(cleanup_error))}"
+        )
+    if diagnostics:
+        original.add_note("cleanup diagnostic: " + "; ".join(diagnostics))
+
+
 class BrowserPublisher:
     """Data-driven browser adapter with conservative publication evidence rules."""
 
@@ -509,6 +530,7 @@ class BrowserPublisher:
             cast(dict[str, object], selector_data["platforms"])[normalized],
         )
         self._locators = cast(dict[str, Locator], self._config["locators"])
+        self._flow = _PLATFORM_FLOWS[normalized]
 
     @classmethod
     def from_managed_chrome(
@@ -524,11 +546,8 @@ class BrowserPublisher:
             connector = PlaywrightBrowserPage.connect
         try:
             page = connector(chrome.cdp_url)
-        except BaseException:
-            try:
-                chrome.close()
-            except Exception:
-                pass
+        except BaseException as exc:
+            _cleanup_failed_browser_setup(exc, chrome)
             raise
         try:
             return cls(
@@ -537,17 +556,8 @@ class BrowserPublisher:
                 selectors,
                 managed_chrome=chrome,
             )
-        except BaseException:
-            close_page = getattr(page, "close", None)
-            if callable(close_page):
-                try:
-                    close_page()
-                except Exception:
-                    pass
-            try:
-                chrome.close()
-            except Exception:
-                pass
+        except BaseException as exc:
+            _cleanup_failed_browser_setup(exc, chrome, (page,))
             raise
 
     def close(self) -> None:
@@ -578,8 +588,7 @@ class BrowserPublisher:
                     detail="the browser session is logged out",
                     next_action="Sign in to the configured profile and probe again.",
                 )
-            for purpose in cast(list[str], self._config.get("before_probe", [])):
-                self.page.click(self._locator(purpose))
+            self._run_phase(self._flow.probe)
             observed = self._observed_identity()
             if not observed:
                 return ProbeResult(
@@ -693,17 +702,12 @@ class BrowserPublisher:
         submit_clicked = False
         try:
             schedule_requested = bool(request.metadata.get("scheduled_at"))
-            for purpose in cast(list[str], self._config.get("before_upload", [])):
-                self.page.click(self._locator(purpose))
+            self._run_phase(self._flow.open_upload)
             self.page.set_input_files(self._locator("upload"), request.media_path)
-            for purpose in cast(list[str], self._config.get("after_upload", [])):
-                if purpose == "processing":
-                    self.page.wait_for(self._locator(purpose))
-                else:
-                    self.page.click(self._locator(purpose))
-            self._apply_metadata(request.metadata)
-            for purpose in cast(list[str], self._config.get("after_metadata", [])):
-                self.page.click(self._locator(purpose))
+            self._run_phase(self._flow.after_upload)
+            self._apply_details(request.metadata)
+            self._run_phase(self._flow.after_details)
+            self._apply_visibility(request.metadata)
             if schedule_requested:
                 self._apply_schedule(request.metadata["scheduled_at"])
             previous_evidence = self._raw_evidence(
@@ -739,7 +743,14 @@ class BrowserPublisher:
                 return observed
         return ""
 
-    def _apply_metadata(self, metadata: Mapping[str, object]) -> None:
+    def _run_phase(self, operations: tuple[str, ...]) -> None:
+        for purpose in operations:
+            if purpose == "processing":
+                self.page.wait_for(self._locator(purpose))
+            else:
+                self.page.click(self._locator(purpose))
+
+    def _apply_details(self, metadata: Mapping[str, object]) -> None:
         caption = str(metadata.get("caption", metadata.get("description", "")))
         if self.platform == "youtube":
             self._fill_if_text("title", metadata.get("title"))
@@ -756,7 +767,6 @@ class BrowserPublisher:
                     self._locator("synthetic_media"),
                     cast(bool, metadata["synthetic_media"]),
                 )
-            self._select_if_text("visibility", metadata.get("visibility"))
         elif self.platform == "tiktok":
             self._fill_if_text("filename_slug", metadata.get("filename_slug"))
             self.page.fill(self._locator("caption"), caption)
@@ -765,6 +775,17 @@ class BrowserPublisher:
                     self.page.check(self._locator(key), cast(bool, metadata[key]))
         else:
             self.page.fill(self._locator("caption"), caption)
+
+    def _apply_visibility(self, metadata: Mapping[str, object]) -> None:
+        if self.platform != "youtube":
+            return
+        visibility = metadata.get("visibility")
+        if not isinstance(visibility, str) or not visibility.strip():
+            return
+        if not self.page.is_visible(self._locator("visibility")):
+            raise BrowserUIError("visibility controls are unavailable: visibility")
+        self.page.select_option(self._locator("visibility"), visibility.strip())
+
     def _apply_schedule(self, scheduled_at: object) -> None:
         if not self.page.is_visible(self._locator("schedule_mode")):
             raise BrowserUIError(
@@ -803,10 +824,6 @@ class BrowserPublisher:
     def _fill_if_text(self, purpose: str, value: object) -> None:
         if purpose in self._locators and isinstance(value, str) and value.strip():
             self.page.fill(self._locator(purpose), value.strip())
-
-    def _select_if_text(self, purpose: str, value: object) -> None:
-        if purpose in self._locators and isinstance(value, str) and value.strip():
-            self.page.select_option(self._locator(purpose), value.strip())
 
     def _wait_for_confirmed_result(
         self,
@@ -1049,15 +1066,8 @@ def register_managed_chrome_adapters(
     try:
         for _platform in SUPPORTED_PLATFORMS:
             pages.append(connector(chrome.cdp_url))
-    except BaseException:
-        for page in reversed(pages):
-            close_page = getattr(page, "close", None)
-            if callable(close_page):
-                try:
-                    close_page()
-                except Exception:
-                    pass
-        chrome.close()
+    except BaseException as exc:
+        _cleanup_failed_browser_setup(exc, chrome, tuple(pages))
         raise
 
     shared_runtime = _SharedManagedRuntime(chrome, len(pages))

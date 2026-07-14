@@ -12,10 +12,10 @@
         {"source": "attribute", "attribute": "href", "pattern": "^/(?:@)?(?P<identity>[A-Za-z0-9._-]+)/?$"},
         {"source": "text", "pattern": "(?P<identity>[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,})"}
       ],
-      "before_probe": [],
-      "before_upload": ["create"],
-      "after_upload": ["advance", "advance"],
-      "after_metadata": [],
+      "probe_operations": [],
+      "open_upload_operations": ["create"],
+      "after_upload_operations": ["advance", "advance"],
+      "after_details_operations": [],
       "locators": {
         "identity": {"kind": "label", "value": "Profile", "purpose": "identity"},
         "create": {"kind": "role", "value": "button", "name": "Create", "purpose": "create"},
@@ -42,10 +42,10 @@
         {"source": "text", "pattern": "(?P<identity>[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,})"},
         {"source": "text", "pattern": "@(?P<identity>[A-Za-z0-9._-]{2,})\\b"}
       ],
-      "before_probe": [],
-      "before_upload": [],
-      "after_upload": [],
-      "after_metadata": [],
+      "probe_operations": [],
+      "open_upload_operations": [],
+      "after_upload_operations": [],
+      "after_details_operations": [],
       "locators": {
         "identity": {"kind": "label", "value": "Account", "purpose": "identity"},
         "upload": {"kind": "css", "value": "input[type=file]", "purpose": "upload"},
@@ -81,10 +81,10 @@
         {"source": "text", "pattern": "(?P<identity>[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,})"},
         {"source": "text", "pattern": "@(?P<identity>[A-Za-z0-9._-]{2,})\\b"}
       ],
-      "before_probe": ["identity_menu"],
-      "before_upload": ["create", "upload_videos"],
-      "after_upload": [],
-      "after_metadata": ["wizard_next", "wizard_next", "wizard_next"],
+      "probe_operations": ["identity_menu"],
+      "open_upload_operations": ["create", "upload_videos"],
+      "after_upload_operations": [],
+      "after_details_operations": ["wizard_next", "wizard_next", "wizard_next"],
       "locators": {
         "identity_menu": {"kind": "role", "value": "button", "name": "Account menu", "purpose": "identity_menu"},
         "identity": {"kind": "label", "value": "Account email", "purpose": "identity"},
@@ -123,10 +123,10 @@
         {"source": "text", "pattern": "(?P<identity>[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,})"},
         {"source": "text", "pattern": "@(?P<identity>[A-Za-z0-9_]{1,15})\\b"}
       ],
-      "before_probe": [],
-      "before_upload": [],
-      "after_upload": ["processing"],
-      "after_metadata": [],
+      "probe_operations": [],
+      "open_upload_operations": [],
+      "after_upload_operations": ["processing"],
+      "after_details_operations": [],
       "locators": {
         "identity": {"kind": "label", "value": "Account menu", "purpose": "identity"},
         "upload": {"kind": "css", "value": "input[type=file]", "purpose": "upload"},
@@ -152,10 +152,10 @@
         {"source": "attribute", "attribute": "href", "pattern": "^https://(?:www\\.)?facebook\\.com/(?P<identity>[A-Za-z0-9._-]+)/?$"},
         {"source": "text", "pattern": "(?P<identity>[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,})"}
       ],
-      "before_probe": [],
-      "before_upload": [],
-      "after_upload": [],
-      "after_metadata": [],
+      "probe_operations": [],
+      "open_upload_operations": [],
+      "after_upload_operations": [],
+      "after_details_operations": [],
       "locators": {
         "identity": {"kind": "label", "value": "Your profile", "purpose": "identity"},
         "upload": {"kind": "css", "value": "input[type=file]", "purpose": "upload"},
@@ -184,10 +184,10 @@
         {"source": "attribute", "attribute": "href", "pattern": "^/@(?P<identity>[A-Za-z0-9._-]+)/?$"},
         {"source": "text", "pattern": "(?P<identity>[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,})"}
       ],
-      "before_probe": [],
-      "before_upload": ["create"],
-      "after_upload": [],
-      "after_metadata": [],
+      "probe_operations": [],
+      "open_upload_operations": ["create"],
+      "after_upload_operations": [],
+      "after_details_operations": [],
       "locators": {
         "identity": {"kind": "label", "value": "Profile", "purpose": "identity"},
         "create": {"kind": "role", "value": "button", "name": "Create", "purpose": "create"},

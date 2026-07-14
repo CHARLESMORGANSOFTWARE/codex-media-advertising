@@ -39,6 +39,7 @@ class FakePage:
         self.schedule_mode_after_upload = False
         self.schedule_mode_after_wizard_clicks = 0
         self.wizard_clicks = 0
+        self.visibility_after_wizard_clicks = 3
 
     def goto(self, url: str) -> None:
         self.actions.append(("goto", url))
@@ -81,6 +82,8 @@ class FakePage:
             raise RuntimeError("Authorization: Bearer very-secret-token")
         if purpose == "wizard_next":
             self.wizard_clicks += 1
+            if self.wizard_clicks >= self.visibility_after_wizard_clicks:
+                self.visible.add("visibility")
             if self.wizard_clicks >= self.schedule_mode_after_wizard_clicks > 0:
                 self.visible.add("schedule_mode")
         if purpose == "schedule_mode" and purpose in self.visible:
@@ -102,6 +105,8 @@ class FakePage:
             self.visible.add("schedule_mode")
 
     def select_option(self, locator: dict[str, str], value: str) -> None:
+        if locator["purpose"] == "visibility" and "visibility" not in self.visible:
+            raise RuntimeError("visibility phase is not exposed")
         self.actions.append(("select", locator["purpose"], value))
 
     def check(self, locator: dict[str, str], checked: bool) -> None:
@@ -157,6 +162,14 @@ def expose_schedule_controls(page: FakePage, platform: str) -> None:
         page.schedule_mode_after_wizard_clicks = 3
     else:
         page.schedule_mode_after_upload = True
+
+
+def assert_actions_in_order(
+    actions: list[tuple[object, ...]], expected: list[tuple[object, ...]]
+) -> None:
+    cursor = 0
+    for action in expected:
+        cursor = actions.index(action, cursor) + 1
 
 
 class FakeClock:
@@ -296,10 +309,10 @@ def test_selector_loader_rejects_changed_platform_operation_sequence(
     tmp_path: Path,
 ) -> None:
     data = load_browser_selectors()
-    data["platforms"]["youtube"]["before_upload"] = []
+    data["platforms"]["youtube"]["open_upload_operations"] = []
     path = tmp_path / "selectors.json"
     path.write_text(json.dumps(data))
-    with pytest.raises(ValueError, match="before_upload|operations"):
+    with pytest.raises(ValueError, match="open_upload_operations|operations"):
         load_browser_selectors(path)
 
 
@@ -392,6 +405,61 @@ def test_single_managed_adapter_construction_failure_closes_page_and_runtime() -
     assert chrome.close_calls == 1
 
 
+def test_connector_error_survives_failing_runtime_cleanup_with_redacted_note() -> None:
+    class ChromeStub:
+        cdp_url = "http://127.0.0.1:49222"
+
+        def close(self) -> None:
+            raise RuntimeError("Authorization: Bearer cleanup-secret")
+
+    def connector(_cdp_url: str) -> FakePage:
+        raise RuntimeError("decisive CDP connector error")
+
+    with pytest.raises(RuntimeError, match="decisive CDP connector error") as caught:
+        BrowserPublisher.from_managed_chrome(
+            "x",
+            ChromeStub(),  # type: ignore[arg-type]
+            connector=connector,
+        )
+    notes = "\n".join(getattr(caught.value, "__notes__", []))
+    assert "cleanup diagnostic" in notes
+    assert "managed_chrome" in notes
+    assert "cleanup-secret" not in notes
+    assert "[REDACTED]" in notes
+
+
+def test_construction_error_survives_page_and_runtime_cleanup_failures() -> None:
+    class ChromeStub:
+        cdp_url = "http://127.0.0.1:49222"
+
+        def close(self) -> None:
+            raise RuntimeError("Authorization: Bearer chrome-cleanup-secret")
+
+    class PageStub(FakePage):
+        def close(self) -> None:
+            raise RuntimeError("Cookie: page-cleanup-secret")
+
+    selectors = load_browser_selectors()
+    selectors["platforms"]["x"]["locators"]["unexpected"] = {
+        "kind": "label",
+        "value": "Unexpected",
+        "purpose": "unexpected",
+    }
+    with pytest.raises(ValueError, match="unexpected") as caught:
+        BrowserPublisher.from_managed_chrome(
+            "x",
+            ChromeStub(),  # type: ignore[arg-type]
+            connector=lambda _cdp_url: PageStub(),
+            selectors=selectors,
+        )
+    notes = "\n".join(getattr(caught.value, "__notes__", []))
+    assert "cleanup diagnostic" in notes
+    assert "page" in notes and "managed_chrome" in notes
+    assert "page-cleanup-secret" not in notes
+    assert "chrome-cleanup-secret" not in notes
+    assert notes.count("[REDACTED]") >= 2
+
+
 def test_register_managed_chrome_adapters_wires_all_six_to_cdp() -> None:
     class ChromeStub:
         cdp_url = "http://127.0.0.1:49222"
@@ -472,6 +540,39 @@ def test_managed_registry_partial_connection_failure_cleans_pages_and_runtime() 
     assert registry.names() == ()
     assert pages and all(page.closed for page in pages)
     assert chrome.close_calls == 1
+
+
+def test_managed_registry_preserves_connector_error_when_cleanup_raises() -> None:
+    class ChromeStub:
+        cdp_url = "http://127.0.0.1:49222"
+
+        def close(self) -> None:
+            raise RuntimeError("Authorization: Bearer registry-chrome-secret")
+
+    class PageStub(FakePage):
+        def close(self) -> None:
+            raise RuntimeError("Cookie: registry-page-secret")
+
+    calls = 0
+
+    def connector(_cdp_url: str) -> FakePage:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("decisive registry connector error")
+        return PageStub()
+
+    with pytest.raises(RuntimeError, match="decisive registry connector error") as caught:
+        browser_adapters.register_managed_chrome_adapters(
+            AdapterRegistry(),
+            ChromeStub(),  # type: ignore[arg-type]
+            connector=connector,
+        )
+    notes = "\n".join(getattr(caught.value, "__notes__", []))
+    assert "cleanup diagnostic" in notes
+    assert "registry-page-secret" not in notes
+    assert "registry-chrome-secret" not in notes
+    assert notes.count("[REDACTED]") >= 2
 
 
 def test_playwright_page_connects_over_cdp_and_maps_semantic_locators(
@@ -922,6 +1023,69 @@ def test_youtube_details_are_applied_before_advancing_wizard(tmp_path: Path) -> 
     first_next = page.actions.index(("click", "wizard_next"))
     assert page.actions.index(("fill", "title", "A useful title")) < first_next
     assert page.actions.index(("check", "audience_not_made_for_kids", True)) < first_next
+
+
+def test_youtube_immediate_flow_respects_details_wizard_visibility_phases(
+    tmp_path: Path,
+) -> None:
+    page = FakePage()
+    set_text_evidence(page, "youtube", "confirmation", "Video published")
+    request = publish_request(tmp_path, "youtube")
+    result = make_publisher("youtube", page).publish(request)
+    assert result.status == PublishStatus.PUBLISHED
+    assert_actions_in_order(
+        page.actions,
+        [
+            ("click", "create"),
+            ("click", "upload_videos"),
+            ("upload", "upload", str(request.media_path)),
+            ("fill", "title", "A useful title"),
+            ("fill", "description", "A useful description"),
+            ("check", "audience_not_made_for_kids", True),
+            ("check", "synthetic_media", True),
+            ("click", "wizard_next"),
+            ("click", "wizard_next"),
+            ("click", "wizard_next"),
+            ("select", "visibility", "unlisted"),
+            ("click", "submit"),
+        ],
+    )
+
+
+def test_youtube_scheduled_flow_respects_details_wizard_visibility_phases(
+    tmp_path: Path,
+) -> None:
+    page = FakePage()
+    expose_schedule_controls(page, "youtube")
+    set_text_evidence(
+        page,
+        "youtube",
+        "schedule_confirmation",
+        "Video scheduled for Jul 20, 2026",
+    )
+    request = publish_request(tmp_path, "youtube", scheduled=True)
+    result = make_publisher("youtube", page).publish(request)
+    assert result.status == PublishStatus.SCHEDULED
+    assert_actions_in_order(
+        page.actions,
+        [
+            ("click", "create"),
+            ("click", "upload_videos"),
+            ("upload", "upload", str(request.media_path)),
+            ("fill", "title", "A useful title"),
+            ("fill", "description", "A useful description"),
+            ("check", "audience_not_made_for_kids", True),
+            ("check", "synthetic_media", True),
+            ("click", "wizard_next"),
+            ("click", "wizard_next"),
+            ("click", "wizard_next"),
+            ("select", "visibility", "unlisted"),
+            ("click", "schedule_mode"),
+            ("fill", "schedule_date", "2026-07-20"),
+            ("fill", "schedule_time", "17:00"),
+            ("click", "schedule_submit"),
+        ],
+    )
 
 
 @pytest.mark.parametrize("platform", ["tiktok", "youtube", "facebook"])
