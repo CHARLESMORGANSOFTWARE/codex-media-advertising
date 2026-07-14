@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import json
 import os
+import secrets
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -31,10 +32,11 @@ class RetryDecision:
 
 def retry_decision(category: str, attempt: int, max_retries: int) -> RetryDecision:
     transient = {"network", "rate_limit", "platform_ui"}
+    effective_max_retries = min(max(0, max_retries), 1)
     retry = (
         category in transient
         and category != "ambiguous_submit"
-        and attempt <= max_retries
+        and attempt <= effective_max_retries
     )
     return RetryDecision(
         retry=retry,
@@ -54,9 +56,14 @@ class QueueClaim:
     idempotency_key: str
     request: PublishRequest
     worker_id: str
+    claim_id: str
     claimed_at: datetime
     lease_expires_at: datetime
     path: Path
+
+
+class ClaimOwnershipError(PermissionError):
+    """Raised when a stale or different worker tries to mutate a claim."""
 
 
 def _utc(value: datetime) -> datetime:
@@ -137,6 +144,11 @@ class QueueStore:
             os.close(fd)
         try:
             os.replace(temporary, path)
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -179,6 +191,7 @@ class QueueStore:
             idempotency_key=str(value["idempotency_key"]),
             request=request,
             worker_id=str(value["worker_id"]),
+            claim_id=str(value["claim_id"]),
             claimed_at=_parse_time(str(value["claimed_at"])),
             lease_expires_at=_parse_time(str(value["lease_expires_at"])),
             path=path,
@@ -197,43 +210,48 @@ class QueueStore:
                 claim_path = self.claims / pending_path.name
                 if claim_path.exists():
                     continue
-                try:
-                    os.replace(pending_path, claim_path)
-                except FileNotFoundError:
-                    continue
-
-                value = json.loads(claim_path.read_text())
+                value = json.loads(pending_path.read_text())
                 claimed_at = _utc(self._clock())
                 value.update(
                     {
                         "worker_id": worker_id,
+                        "claim_id": secrets.token_urlsafe(32),
                         "claimed_at": _timestamp(claimed_at),
                         "lease_expires_at": _timestamp(
                             claimed_at + timedelta(seconds=lease_seconds)
                         ),
                     }
                 )
-                self._write_json(claim_path, value)
+                self._write_json(pending_path, value)
+                try:
+                    os.replace(pending_path, claim_path)
+                except FileNotFoundError:
+                    continue
                 return self._claim_from_record(claim_path, value)
         return None
 
-    def _claim_path(self, claim_or_key: QueueClaim | str) -> Path:
-        key = (
-            claim_or_key.idempotency_key
-            if isinstance(claim_or_key, QueueClaim)
-            else claim_or_key
-        )
-        return self.claims / f"{key}.json"
+    def _claim_path(self, claim: QueueClaim) -> Path:
+        return self.claims / f"{claim.idempotency_key}.json"
+
+    def _assert_owner(
+        self, claim: QueueClaim, value: dict[str, object]
+    ) -> None:
+        if (
+            value.get("worker_id") != claim.worker_id
+            or value.get("claim_id") != claim.claim_id
+        ):
+            raise ClaimOwnershipError("claim owner does not match current lease")
 
     def _transition(
         self,
-        claim: QueueClaim | str,
+        claim: QueueClaim,
         result: PublishResult,
         destination: Path,
     ) -> dict[str, object]:
         claim_path = self._claim_path(claim)
         with self._locked():
             value = json.loads(claim_path.read_text())
+            self._assert_owner(claim, value)
             request = PublishRequest.model_validate(value["request"])
             receipt = self.receipts.write_attempt(request, result)
             value["result"] = result.model_dump(mode="json")
@@ -243,14 +261,23 @@ class QueueStore:
             return receipt
 
     def complete(
-        self, claim: QueueClaim | str, result: PublishResult
+        self, claim: QueueClaim, result: PublishResult
     ) -> dict[str, object]:
         return self._transition(claim, result, self.completed)
 
     def fail(
-        self, claim: QueueClaim | str, result: PublishResult
+        self, claim: QueueClaim, result: PublishResult
     ) -> dict[str, object]:
         return self._transition(claim, result, self.failed)
+
+    def requeue(self, claim: QueueClaim) -> Path:
+        claim_path = self._claim_path(claim)
+        pending_path = self.pending / claim_path.name
+        with self._locked():
+            value = json.loads(claim_path.read_text())
+            self._assert_owner(claim, value)
+            os.replace(claim_path, pending_path)
+        return pending_path
 
     def recover_expired(self) -> int:
         now = _utc(self._clock())

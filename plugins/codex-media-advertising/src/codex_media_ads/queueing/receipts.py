@@ -47,21 +47,31 @@ def _idempotency_key(request: PublishRequest) -> str:
 
 
 def _positive_evidence(record: dict[str, object]) -> bool:
-    if bool(str(record.get("platform_id", "")).strip()) or bool(
-        str(record.get("post_url", "")).strip()
+    def positive_id(value: object) -> bool:
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        return isinstance(value, int)
+
+    post_url = record.get("post_url")
+    if positive_id(record.get("platform_id")) or (
+        isinstance(post_url, str) and bool(post_url.strip())
     ):
         return True
     evidence = record.get("evidence")
     if not isinstance(evidence, dict):
         return False
     return any(evidence.get(key) is True for key in POSITIVE_EVIDENCE_FLAGS) or any(
-        bool(str(evidence.get(key, "")).strip()) for key in POSITIVE_EVIDENCE_IDS
+        positive_id(evidence.get(key)) for key in POSITIVE_EVIDENCE_IDS
     )
 
 
 def _is_success(record: dict[str, object]) -> bool:
-    return str(record.get("status", "")) in SUCCESS_STATUSES and _positive_evidence(
-        record
+    return (
+        record.get("dry_run") is not True
+        and str(record.get("status", "")) in SUCCESS_STATUSES
+        and _positive_evidence(record)
     )
 
 
@@ -107,6 +117,28 @@ class ReceiptStore:
 
     def _latest_path(self, key: str) -> Path:
         return self.root / f"{key}.json"
+
+    def _append_record(self, record: dict[str, object]) -> None:
+        encoded = (
+            json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode()
+        fd = os.open(
+            self.root / "receipts.jsonl",
+            os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+            SECRET_FILE_MODE,
+        )
+        try:
+            os.write(fd, encoded)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _records(self) -> list[dict[str, object]]:
+        try:
+            lines = (self.root / "receipts.jsonl").read_text().splitlines()
+        except FileNotFoundError:
+            return []
+        return [json.loads(line) for line in lines if line.strip()]
 
     def _read_latest(self, key: str) -> dict[str, object] | None:
         try:
@@ -172,6 +204,7 @@ class ReceiptStore:
             "revision": request.revision,
             "platform": request.platform,
             "account_id": request.account.account_id,
+            "dry_run": request.dry_run,
             "status": normalized_status,
             "occurred_at": _timestamp(when),
             "platform_id": platform_id,
@@ -180,26 +213,54 @@ class ReceiptStore:
             "error_category": error_category,
             "detail": detail,
         }
-        encoded = (
-            json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
-        ).encode()
-
         with self._locked():
-            fd = os.open(
-                self.root / "receipts.jsonl",
-                os.O_APPEND | os.O_CREAT | os.O_WRONLY,
-                SECRET_FILE_MODE,
-            )
-            try:
-                os.write(fd, encoded)
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+            self._append_record(record)
 
             previous = self._read_latest(key)
             if previous is None or not (_is_success(previous) and not _is_success(record)):
                 self._replace_latest(key, record)
         return record
+
+    def _consecutive_failures_unlocked(
+        self, platform: str, account_id: str
+    ) -> int:
+        failures = 0
+        for record in self._records():
+            if (
+                record.get("platform") != platform
+                or record.get("account_id") != account_id
+            ):
+                continue
+            if record.get("event") == "resume":
+                failures = 0
+            elif record.get("dry_run") is True:
+                continue
+            elif _is_success(record):
+                failures = 0
+            elif record.get("status") != PublishStatus.SKIPPED.value:
+                failures += 1
+        return failures
+
+    def consecutive_failures(self, platform: str, account_id: str) -> int:
+        with self._locked():
+            return self._consecutive_failures_unlocked(platform, account_id)
+
+    def is_paused(
+        self, platform: str, account_id: str, *, threshold: int = 2
+    ) -> bool:
+        if threshold < 1:
+            raise ValueError("pause threshold must be positive")
+        return self.consecutive_failures(platform, account_id) >= threshold
+
+    def resume(self, platform: str, account_id: str) -> None:
+        record: dict[str, object] = {
+            "event": "resume",
+            "platform": platform,
+            "account_id": account_id,
+            "occurred_at": _timestamp(_parse_time(None, self._clock)),
+        }
+        with self._locked():
+            self._append_record(record)
 
     def latest_success(
         self, request_or_key: PublishRequest | str
@@ -216,18 +277,11 @@ class ReceiptStore:
     def count_successes_on_date(self, day: str | date, timezone_name: str) -> int:
         target = date.fromisoformat(day) if isinstance(day, str) else day
         zone = ZoneInfo(timezone_name)
-        path = self.root / "receipts.jsonl"
         with self._locked():
-            try:
-                lines = path.read_text().splitlines()
-            except FileNotFoundError:
-                return 0
+            records = self._records()
 
         count = 0
-        for line in lines:
-            if not line.strip():
-                continue
-            record = json.loads(line)
+        for record in records:
             occurred_at = _parse_time(str(record["occurred_at"]), self._clock)
             if _is_success(record) and occurred_at.astimezone(zone).date() == target:
                 count += 1

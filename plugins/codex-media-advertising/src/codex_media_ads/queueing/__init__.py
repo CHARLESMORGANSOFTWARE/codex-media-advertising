@@ -2,6 +2,7 @@
 
 from .receipts import ReceiptStore
 from .store import (
+    ClaimOwnershipError,
     EnqueueResult,
     QueueClaim,
     QueueStore,
@@ -11,6 +12,7 @@ from .store import (
 )
 
 __all__ = [
+    "ClaimOwnershipError",
     "EnqueueResult",
     "QueueClaim",
     "QueueStore",
