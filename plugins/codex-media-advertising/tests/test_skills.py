@@ -104,3 +104,9 @@ def test_installation_docs_use_public_marketplace_commands_and_accurate_extras()
     assert "codex plugin add codex-media-advertising@personal" in text
     assert "does not install the optional `browser` or `youtube` Python extras" in text
     assert "optional local dependencies available on the machine" not in text
+
+
+def test_skill_sibling_references_are_plugin_root_relative() -> None:
+    for name in SKILL_NAMES:
+        text = (PLUGIN / "skills" / name / "SKILL.md").read_text()
+        assert not re.search(r"(?<![./])(?:docs|examples)/", text), name

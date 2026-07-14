@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 from pathlib import Path
 
@@ -296,6 +297,7 @@ def test_secret_import_rejects_symlinks_and_copies_atomically_private(
 ) -> None:
     source = tmp_path / "credentials.json"
     source.write_text(json.dumps({"access_token": "private-value"}))
+    source.chmod(0o600)
     symlink = tmp_path / "credentials-link.json"
     symlink.symlink_to(source)
     service = _service(tmp_path)
@@ -314,6 +316,7 @@ def test_secret_import_rejects_symlinks_and_copies_atomically_private(
 def test_secret_import_rejects_destination_traversal(tmp_path: Path) -> None:
     source = tmp_path / "credentials.json"
     source.write_text("private")
+    source.chmod(0o600)
 
     with pytest.raises(SecretImportError):
         _service(tmp_path).import_secret(source, "../escaped.json")
@@ -324,6 +327,7 @@ def test_secret_import_rejects_a_symlinked_source_parent(tmp_path: Path) -> None
     actual.mkdir()
     source = actual / "credentials.json"
     source.write_text("private")
+    source.chmod(0o600)
     linked = tmp_path / "linked"
     linked.symlink_to(actual, target_is_directory=True)
 
@@ -341,8 +345,31 @@ def test_secret_import_rejects_symlinked_private_destination_root(
     (service.state_root / "secrets").symlink_to(outside, target_is_directory=True)
     source = tmp_path / "credential.json"
     source.write_text("private")
+    source.chmod(0o600)
 
     with pytest.raises(SecretImportError, match="symlink"):
         service.import_secret(source, "x.json")
 
     assert not (outside / "x.json").exists()
+
+
+def test_secret_import_rejects_group_or_other_permissions(tmp_path: Path) -> None:
+    source = tmp_path / "credentials.json"
+    source.write_text("private")
+    source.chmod(0o640)
+
+    with pytest.raises(SecretImportError, match="owner-only"):
+        _service(tmp_path).import_secret(source, "x.json")
+
+
+def test_secret_import_rejects_a_source_not_owned_by_current_user(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "credentials.json"
+    source.write_text("private")
+    source.chmod(0o600)
+    owner_uid = source.stat().st_uid
+    monkeypatch.setattr(os, "getuid", lambda: owner_uid + 1)
+
+    with pytest.raises(SecretImportError, match="owned by the current user"):
+        _service(tmp_path).import_secret(source, "x.json")

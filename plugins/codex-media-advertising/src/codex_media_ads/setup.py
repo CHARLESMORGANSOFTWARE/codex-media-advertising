@@ -484,6 +484,12 @@ class SetupService:
             raise SecretImportError("secret source cannot be a symlink")
         if not stat.S_ISREG(info.st_mode):
             raise SecretImportError("secret source must be a regular file")
+        if info.st_uid != os.getuid():
+            raise SecretImportError("secret source must be owned by the current user")
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            raise SecretImportError(
+                "secret source must be owner-only (no group/other permissions)"
+            )
 
         flags = os.O_RDONLY
         if hasattr(os, "O_NOFOLLOW"):

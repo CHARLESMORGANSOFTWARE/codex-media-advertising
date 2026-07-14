@@ -6,8 +6,8 @@ description: Use when building, queueing, publishing, probing, or reporting rece
 # Media Publishing
 
 Use this skill for an explicit publish request, a queued campaign, a scheduled
-post, or a receipt/status report. Read `docs/platform-notes.md` before choosing
-an API or isolated-browser route.
+post, or a receipt/status report. Read `../../docs/platform-notes.md` before
+choosing an API or isolated-browser route.
 
 ## Publish sequence
 

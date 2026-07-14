@@ -7,8 +7,8 @@ description: Use when diagnosing blocked setup, authentication, rendering, queue
 
 Use this skill for failures, stalled jobs, missing receipts, paused channels,
 dependency drift, or questions about whether an unattended run is healthy.
-Read `docs/automations.md` and `docs/platform-notes.md`; inspect private logs
-and receipts only in the configured state root.
+Read `../../docs/automations.md` and `../../docs/platform-notes.md`; inspect
+private logs and receipts only in the configured state root.
 
 ## Diagnostic order
 

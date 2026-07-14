@@ -6,8 +6,8 @@ description: Use when turning a brand, offer, audience, and rights-cleared asset
 # Media Campaign
 
 Use this skill when the user wants a campaign brief, images, narration, a
-vertical video, or destination-specific copy. Read `docs/platform-notes.md` and
-the example manifests in `examples/` before asking for missing inputs.
+vertical video, or destination-specific copy. Read `../../docs/platform-notes.md`
+and the example manifests in `../../examples/` before asking for missing inputs.
 
 ## Clarify the brief
 

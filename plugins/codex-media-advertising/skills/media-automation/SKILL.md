@@ -6,8 +6,8 @@ description: Use when creating, installing, inspecting, pausing, or changing rec
 # Media Automation
 
 Use this skill when the user asks Codex to post on a cadence, run unattended,
-install a LaunchAgent, or change channel caps. Read `docs/automations.md` and
-`docs/authentication.md` first.
+install a LaunchAgent, or change channel caps. Read `../../docs/automations.md`
+and `../../docs/authentication.md` first.
 
 ## Define the automation
 

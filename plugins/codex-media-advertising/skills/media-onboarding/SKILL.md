@@ -10,9 +10,10 @@ their own accounts, or asking whether a channel is ready for unattended work.
 
 ## Before changing anything
 
-Read `docs/installation.md`, `docs/authentication.md`, and
-`docs/platform-notes.md`. Confirm the user owns the accounts and publishing
-rights. Keep all credentials and runtime state under `~/.codex-media-ads/`;
+Read `../../docs/installation.md`, `../../docs/authentication.md`, and
+`../../docs/platform-notes.md`. Confirm the user owns the accounts and
+publishing rights. Keep all credentials and runtime state under
+`~/.codex-media-ads/`;
 never put secrets in a campaign file, prompt, checkout, or receipt summary.
 
 ## Safe sequence
