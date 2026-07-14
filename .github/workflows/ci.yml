@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: brew install ffmpeg
+      - run: python -m pip install -e 'plugins/codex-media-advertising[test,browser,youtube]'
+      - run: python -m playwright install chromium
+      - run: python -m pytest plugins/codex-media-advertising/tests -q
+      - run: python plugins/codex-media-advertising/scripts/scan_release.py .
+      - run: python plugins/codex-media-advertising/scripts/build_release.py .
