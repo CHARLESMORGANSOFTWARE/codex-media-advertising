@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import http.client
+import json
 import os
 import re
 import shutil
@@ -13,6 +15,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Protocol, Sequence
 
 from ..config import PRIVATE_MODES, SECRET_FILE_MODE
+from .base import redact_diagnostic
 
 
 _EXCLUDED_DIRECTORIES = {
@@ -34,7 +37,11 @@ def _excluded(path: Path) -> bool:
     lowered = name.casefold()
     if path.is_symlink():
         return True
-    if lowered in _EXCLUDED_DIRECTORIES:
+    if (
+        lowered in _EXCLUDED_DIRECTORIES
+        or lowered.endswith("cache")
+        or "shader" in lowered
+    ):
         return True
     if lowered in _EXCLUDED_FILES or lowered.endswith(".lock"):
         return True
@@ -143,7 +150,8 @@ class ManagedChrome:
     port: int
     log_path: Path
     process_table: Callable[[], Iterable[ProcessRecord]] = _system_process_table
-    kill: Callable[[int, int], None] = os.kill
+    get_process_group: Callable[[int], int] = os.getpgid
+    kill_group: Callable[[int, int], None] = os.killpg
     sleep: Callable[[float], None] = time.sleep
     monotonic: Callable[[], float] = time.monotonic
     _log_handle: object | None = field(default=None, repr=False)
@@ -153,31 +161,51 @@ class ManagedChrome:
     def cdp_url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
-    def _signal(self, pids: Iterable[int], value: int) -> None:
-        for pid in sorted(set(pids), reverse=True):
-            try:
-                self.kill(pid, value)
-            except ProcessLookupError:
-                continue
-
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        try:
+            # Popen.poll() returning None proves this is still our unreaped child,
+            # so its PID cannot have been recycled. start_new_session=True makes
+            # that PID the uniquely owned process-group ID.
+            process_group = self._verified_process_group()
+            if process_group is None:
+                return
+            try:
+                self.kill_group(process_group, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+            deadline = self.monotonic() + 5.0
+            while self.monotonic() < deadline:
+                self.sleep(0.1)
+            process_group = self._verified_process_group()
+            if process_group is None:
+                return
+            try:
+                self.kill_group(process_group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        finally:
+            if self._log_handle is not None:
+                close = getattr(self._log_handle, "close", None)
+                if close is not None:
+                    close()
+
+    def _verified_process_group(self) -> int | None:
+        if self.process.poll() is not None:
+            return None
         matching = _matching_processes(self.process_table(), self.clone_root)
-        self._signal(matching, signal.SIGTERM)
-        deadline = self.monotonic() + 5.0
-        remaining = matching
-        while remaining and self.monotonic() < deadline:
-            self.sleep(0.1)
-            remaining = _matching_processes(self.process_table(), self.clone_root)
-        if remaining:
-            remaining = _matching_processes(self.process_table(), self.clone_root)
-            self._signal(remaining, signal.SIGKILL)
-        if self._log_handle is not None:
-            close = getattr(self._log_handle, "close", None)
-            if close is not None:
-                close()
+        if self.process.pid not in matching:
+            raise RuntimeError(
+                "refusing to signal Chrome because clone process identity changed"
+            )
+        process_group = self.get_process_group(self.process.pid)
+        if process_group != self.process.pid:
+            raise RuntimeError(
+                "refusing to signal Chrome because process group identity changed"
+            )
+        return process_group
 
     def __enter__(self) -> ManagedChrome:
         return self
@@ -190,6 +218,37 @@ def _loopback_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
         return int(listener.getsockname()[1])
+
+
+def _probe_loopback_cdp(port: int) -> bool:
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.2)
+    try:
+        connection.request("GET", "/json/version")
+        response = connection.getresponse()
+        if response.status != 200:
+            return False
+        payload = json.loads(response.read().decode("utf-8"))
+        return bool(payload.get("webSocketDebuggerUrl"))
+    except (OSError, ValueError, http.client.HTTPException):
+        return False
+    finally:
+        connection.close()
+
+
+def _bounded_log_tail(path: Path, limit: int = 4096) -> str:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            start = max(0, size - limit)
+            handle.seek(start)
+            raw = handle.read(limit)
+    except OSError as exc:
+        return f"log unavailable: {redact_diagnostic(str(exc))}"
+    if start:
+        newline = raw.find(b"\n")
+        raw = b"" if newline < 0 else raw[newline + 1 :]
+    return redact_diagnostic(raw.decode("utf-8", errors="replace"))
 
 
 def _is_within(path: Path, parent: Path) -> bool:
@@ -208,6 +267,13 @@ def launch_chrome(
     state_root: Path,
     extra_args: Sequence[str] = (),
     popen: Callable[..., PopenLike] = subprocess.Popen,
+    startup_timeout: float = 15.0,
+    cdp_probe: Callable[[int], bool] = _probe_loopback_cdp,
+    process_table: Callable[[], Iterable[ProcessRecord]] = _system_process_table,
+    get_process_group: Callable[[int], int] = os.getpgid,
+    kill_group: Callable[[int, int], None] = os.killpg,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> ManagedChrome:
     """Launch a single isolated Chrome run using only private state-owned paths."""
 
@@ -219,6 +285,8 @@ def launch_chrome(
     )
     if any(str(argument).startswith(managed_prefixes) for argument in extra_args):
         raise ValueError("extra_args contains a managed Chrome argument")
+    if startup_timeout <= 0:
+        raise ValueError("startup_timeout must be positive")
     state_root = Path(state_root).expanduser().resolve()
     state_root.mkdir(mode=PRIVATE_MODES, parents=True, exist_ok=True)
     state_root.chmod(PRIVATE_MODES)
@@ -258,10 +326,39 @@ def launch_chrome(
     except BaseException:
         log_handle.close()
         raise
-    return ManagedChrome(
+    managed = ManagedChrome(
         process=process,
         clone_root=clone_root,
         port=port,
         log_path=log_path,
+        process_table=process_table,
+        get_process_group=get_process_group,
+        kill_group=kill_group,
+        sleep=sleep,
+        monotonic=monotonic,
         _log_handle=log_handle,
+    )
+    deadline = monotonic() + startup_timeout
+    failure = ""
+    while True:
+        returncode = process.poll()
+        if returncode is not None:
+            failure = f"Chrome exited with {returncode} before CDP became ready"
+            break
+        if cdp_probe(port):
+            return managed
+        if monotonic() >= deadline:
+            failure = f"Chrome CDP startup timed out after {startup_timeout:g} seconds"
+            break
+        sleep(0.1)
+
+    cleanup_detail = ""
+    try:
+        managed.close()
+    except Exception as exc:
+        cleanup_detail = f"; cleanup={redact_diagnostic(str(exc))}"
+    diagnostic = _bounded_log_tail(log_path)
+    safe_log_path = redact_diagnostic(str(log_path))
+    raise RuntimeError(
+        f"{failure}; log={safe_log_path}; diagnostic={diagnostic}{cleanup_detail}"
     )

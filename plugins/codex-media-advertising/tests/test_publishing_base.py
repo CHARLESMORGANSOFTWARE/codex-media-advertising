@@ -117,3 +117,23 @@ def test_adapter_exceptions_are_stable_and_redacted(exception: Exception, expect
     assert result.category == expected
     assert "secret-value" not in result.detail
     assert "private-cookie" not in result.detail
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "Authorization: Bearer bearer-secret trailing-secret",
+        "Authorization Bearer bearer-secret trailing-secret",
+        '{"token": "json-secret", "safe": true}',
+        '{"access_token":"access-secret","refresh_token":"refresh-secret"}',
+        "request failed?access_token=query-secret&safe=yes",
+    ],
+)
+def test_adapter_redaction_covers_headers_json_and_oauth_tokens(detail: str) -> None:
+    result = normalize_adapter_error(RuntimeError(detail))
+    assert "bearer-secret" not in result.detail
+    assert "trailing-secret" not in result.detail
+    assert "json-secret" not in result.detail
+    assert "access-secret" not in result.detail
+    assert "refresh-secret" not in result.detail
+    assert "query-secret" not in result.detail

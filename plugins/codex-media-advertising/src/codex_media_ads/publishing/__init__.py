@@ -9,7 +9,9 @@ from .base import (
     ValidationResult,
     normalize_adapter_error,
     probe_identity,
+    redact_diagnostic,
 )
+from .chrome import ManagedChrome, clone_profile
 
 __all__ = [
     "AdapterError",
@@ -20,4 +22,7 @@ __all__ = [
     "ValidationResult",
     "normalize_adapter_error",
     "probe_identity",
+    "redact_diagnostic",
+    "ManagedChrome",
+    "clone_profile",
 ]

@@ -181,14 +181,33 @@ def probe_identity(expected_identity: str, observed_identity: str) -> Validation
     return ValidationResult(ok=True)
 
 
-_SECRET_ASSIGNMENT = re.compile(
-    r"(?i)\b(token|secret|password|cookie|authorization|api[_-]?key|oauth[_-]?code)\b"
-    r"\s*[:=]\s*([^\s,;]+)"
+_AUTHORIZATION_HEADER = re.compile(
+    r"(?im)(\bauthorization\b\s*[:=]\s*)[^\r\n]+"
 )
+_AUTHORIZATION_SPACE = re.compile(
+    r"(?im)(\bauthorization\b\s+)(?![:=])[^\r\n]+"
+)
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)([\"']?(?:access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|"
+    r"password|cookie|api[_-]?key|oauth[_-]?code)[\"']?\s*[:=]\s*)"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s&,;}]+)"
+)
+_BEARER_VALUE = re.compile(r"(?i)(\bbearer\s+)[^\s,;]+")
 
 
-def _redact_detail(value: str) -> str:
-    redacted = _SECRET_ASSIGNMENT.sub(lambda match: f"{match.group(1)}=[REDACTED]", value)
+def redact_diagnostic(value: str) -> str:
+    redacted = _AUTHORIZATION_HEADER.sub(
+        lambda match: f"{match.group(1)}[REDACTED]", value
+    )
+    redacted = _AUTHORIZATION_SPACE.sub(
+        lambda match: f"{match.group(1)}[REDACTED]", redacted
+    )
+    redacted = _SECRET_ASSIGNMENT.sub(
+        lambda match: f"{match.group(1)}[REDACTED]", redacted
+    )
+    redacted = _BEARER_VALUE.sub(
+        lambda match: f"{match.group(1)}[REDACTED]", redacted
+    )
     return redacted[:1000]
 
 
@@ -211,7 +230,7 @@ def normalize_adapter_error(exc: BaseException) -> AdapterError:
         category = ErrorCategory.INTERNAL
         action = "Inspect the adapter diagnostic log before attempting another live run."
         retryable = False
-    detail = _redact_detail(str(exc) or exc.__class__.__name__)
+    detail = redact_diagnostic(str(exc) or exc.__class__.__name__)
     return AdapterError(
         category=category,
         detail=detail,

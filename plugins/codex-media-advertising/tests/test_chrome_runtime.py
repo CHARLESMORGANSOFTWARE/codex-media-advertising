@@ -13,6 +13,14 @@ from codex_media_ads.publishing.chrome import (
 )
 
 
+def test_safe_chrome_api_is_exported_from_publishing_package() -> None:
+    from codex_media_ads.publishing import ManagedChrome as ExportedChrome
+    from codex_media_ads.publishing import clone_profile as exported_clone
+
+    assert ExportedChrome is ManagedChrome
+    assert exported_clone is clone_profile
+
+
 def make_source(root: Path) -> Path:
     root.mkdir()
     (root / "Local State").write_text('{"profile": {}}')
@@ -24,6 +32,9 @@ def make_source(root: Path) -> Path:
         "Code Cache/js/data",
         "GPUCache/data",
         "ShaderCache/data",
+        "DawnGraphiteCache/data",
+        "DawnWebGPUCache/data",
+        "GraphiteDawnCache/data",
         "Service Worker/CacheStorage/data",
         "Service Worker/ScriptCache/data",
         "Crashpad/settings.dat",
@@ -100,6 +111,7 @@ def test_launch_uses_private_clone_dynamic_loopback_cdp_and_per_run_log(tmp_path
         profile_name="Profile 1",
         state_root=tmp_path / "private-state",
         popen=popen,
+        cdp_probe=lambda _port: True,
     )
 
     argv = captured["argv"]
@@ -165,32 +177,142 @@ def test_close_terms_then_kills_only_processes_matching_clone_root(tmp_path: Pat
         port=9222,
         log_path=tmp_path / "run.log",
         process_table=process_table,
-        kill=lambda pid, sig: signals.append((pid, sig)),
+        kill_group=lambda pgid, sig: signals.append((pgid, sig)),
+        get_process_group=lambda pid: pid,
         sleep=lambda _: None,
         monotonic=lambda: next(clock),
     )
     chrome.close()
 
-    assert (101, 15) in signals and (102, 15) in signals
-    assert (101, 9) in signals and (102, 9) in signals
-    assert all(pid != 999 for pid, _ in signals)
-    assert all(pid != 998 for pid, _ in signals)
+    assert signals == [(101, 15), (101, 9)]
 
 
 def test_close_is_idempotent_and_never_invokes_broad_process_kill(tmp_path: Path) -> None:
     clone = tmp_path / "clone"
     clone.mkdir()
     signals: list[tuple[int, int]] = []
+    process = FakeProcess()
+    process.returncode = 0
     chrome = ManagedChrome(
-        process=FakeProcess(),
+        process=process,
         clone_root=clone,
         port=1234,
         log_path=tmp_path / "run.log",
         process_table=lambda: [],
-        kill=lambda pid, sig: signals.append((pid, sig)),
+        kill_group=lambda pgid, sig: signals.append((pgid, sig)),
+        get_process_group=lambda pid: pid,
         sleep=lambda _: None,
         monotonic=lambda: 0.0,
     )
     chrome.close()
     chrome.close()
     assert signals == []
+
+
+def test_close_refuses_stale_snapshot_pid_and_never_signals_reused_process(tmp_path: Path) -> None:
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    marker = f"--user-data-dir={clone.resolve()}"
+    process = FakeProcess(401)
+    signals: list[tuple[int, int]] = []
+    chrome = ManagedChrome(
+        process=process,
+        clone_root=clone,
+        port=1234,
+        log_path=tmp_path / "run.log",
+        process_table=lambda: [ProcessRecord(401, 1, f"chrome {marker}")],
+        get_process_group=lambda _pid: 777,
+        kill_group=lambda pgid, sig: signals.append((pgid, sig)),
+    )
+    with pytest.raises(RuntimeError, match="process group identity"):
+        chrome.close()
+    assert signals == []
+
+
+def test_close_closes_log_and_remains_idempotent_when_discovery_raises(tmp_path: Path) -> None:
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    log = (tmp_path / "run.log").open("wb")
+    chrome = ManagedChrome(
+        process=FakeProcess(401),
+        clone_root=clone,
+        port=1234,
+        log_path=tmp_path / "run.log",
+        process_table=lambda: (_ for _ in ()).throw(OSError("ps failed")),
+        get_process_group=lambda pid: pid,
+        kill_group=lambda _pgid, _sig: None,
+        _log_handle=log,
+    )
+    with pytest.raises(OSError, match="ps failed"):
+        chrome.close()
+    assert log.closed
+    chrome.close()
+
+
+def test_close_closes_log_and_remains_idempotent_when_group_signal_raises(tmp_path: Path) -> None:
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    marker = f"--user-data-dir={clone.resolve()}"
+    log = (tmp_path / "run.log").open("wb")
+    chrome = ManagedChrome(
+        process=FakeProcess(401),
+        clone_root=clone,
+        port=1234,
+        log_path=tmp_path / "run.log",
+        process_table=lambda: [ProcessRecord(401, 1, f"chrome {marker}")],
+        get_process_group=lambda pid: pid,
+        kill_group=lambda _pgid, _sig: (_ for _ in ()).throw(OSError("signal failed")),
+        _log_handle=log,
+    )
+    with pytest.raises(OSError, match="signal failed"):
+        chrome.close()
+    assert log.closed
+    chrome.close()
+
+
+def test_launch_waits_for_cdp_and_reports_redacted_bounded_log_on_early_exit(tmp_path: Path) -> None:
+    source = make_source(tmp_path / "source")
+
+    def popen(_argv, **kwargs):
+        kwargs["stdout"].write(
+            b"Authorization: Bearer bearer-secret remainder\n"
+            + b"x" * 9000
+            + b'\n{"access_token":"access-secret"}\n'
+        )
+        process = FakeProcess()
+        process.returncode = 17
+        return process
+
+    with pytest.raises(RuntimeError) as captured:
+        launch_chrome(
+            chrome_path=Path("chrome"),
+            profile_source=source,
+            profile_name="Profile 1",
+            state_root=tmp_path / "state",
+            popen=popen,
+            cdp_probe=lambda _port: False,
+            startup_timeout=1,
+        )
+    message = str(captured.value)
+    assert "exited with 17" in message
+    assert "bearer-secret" not in message
+    assert "access-secret" not in message
+    assert len(message) < 6000
+
+
+def test_launch_times_out_when_cdp_never_becomes_ready(tmp_path: Path) -> None:
+    source = make_source(tmp_path / "source")
+    clock = iter([0.0, 0.0, 2.0])
+    with pytest.raises(RuntimeError, match="CDP startup timed out"):
+        launch_chrome(
+            chrome_path=Path("chrome"),
+            profile_source=source,
+            profile_name="Profile 1",
+            state_root=tmp_path / "state",
+            popen=lambda *_args, **_kwargs: FakeProcess(),
+            cdp_probe=lambda _port: False,
+            startup_timeout=1,
+            monotonic=lambda: next(clock),
+            sleep=lambda _seconds: None,
+            process_table=lambda: [],
+        )
