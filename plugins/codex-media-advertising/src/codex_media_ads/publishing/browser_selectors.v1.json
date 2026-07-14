@@ -1,0 +1,125 @@
+{
+  "schema_version": "1",
+  "platforms": {
+    "instagram": {
+      "url": "https://www.instagram.com/",
+      "login_markers": ["Log in", "Forgot password"],
+      "post_link_pattern": "https://(?:www\\.)?instagram\\.com/(?:p|reel)/[A-Za-z0-9_-]+/?(?:\\?.*)?",
+      "supports_schedule": false,
+      "before_upload": ["create"],
+      "after_upload": ["advance", "advance"],
+      "locators": {
+        "identity": {"kind": "label", "value": "Profile", "purpose": "identity"},
+        "create": {"kind": "role", "value": "button", "name": "Create", "purpose": "create"},
+        "upload": {"kind": "css", "value": "input[type=file]", "purpose": "upload"},
+        "advance": {"kind": "role", "value": "button", "name": "Next", "purpose": "advance"},
+        "caption": {"kind": "label", "value": "Write a caption", "purpose": "caption"},
+        "submit": {"kind": "role", "value": "button", "name": "Share", "purpose": "submit"},
+        "confirmation": {"kind": "text", "value": "Your post has been shared", "purpose": "confirmation"},
+        "permalink": {"kind": "role", "value": "link", "name": "View post", "purpose": "permalink"},
+        "platform_id": {"kind": "label", "value": "Post identifier", "purpose": "platform_id"}
+      }
+    },
+    "tiktok": {
+      "url": "https://www.tiktok.com/tiktokstudio/upload",
+      "login_markers": ["Log in", "Sign up"],
+      "post_link_pattern": "https://(?:www\\.)?tiktok\\.com/@[^/]+/video/[0-9]+(?:\\?.*)?",
+      "supports_schedule": true,
+      "before_upload": [],
+      "after_upload": [],
+      "locators": {
+        "identity": {"kind": "label", "value": "Account", "purpose": "identity"},
+        "upload": {"kind": "css", "value": "input[type=file]", "purpose": "upload"},
+        "filename_slug": {"kind": "label", "value": "Caption", "purpose": "filename_slug"},
+        "caption": {"kind": "label", "value": "Caption", "purpose": "caption"},
+        "allow_comments": {"kind": "label", "value": "Allow comments", "purpose": "allow_comments"},
+        "allow_duet": {"kind": "label", "value": "Allow Duet", "purpose": "allow_duet"},
+        "allow_stitch": {"kind": "label", "value": "Allow Stitch", "purpose": "allow_stitch"},
+        "scheduled_at": {"kind": "label", "value": "Schedule", "purpose": "scheduled_at"},
+        "submit": {"kind": "role", "value": "button", "name": "Post", "purpose": "submit"},
+        "confirmation": {"kind": "text", "value": "Your video is being uploaded", "purpose": "confirmation"},
+        "permalink": {"kind": "role", "value": "link", "name": "View profile", "purpose": "permalink"},
+        "platform_id": {"kind": "label", "value": "Video ID", "purpose": "platform_id"}
+      }
+    },
+    "youtube": {
+      "url": "https://studio.youtube.com/",
+      "login_markers": ["Sign in", "Choose an account"],
+      "post_link_pattern": "https://(?:(?:www\\.)?youtube\\.com/watch\\?v=|youtu\\.be/)[A-Za-z0-9_-]+(?:[&?].*)?",
+      "supports_schedule": true,
+      "before_upload": ["create"],
+      "after_upload": [],
+      "locators": {
+        "identity": {"kind": "label", "value": "Account", "purpose": "identity"},
+        "create": {"kind": "role", "value": "button", "name": "Create", "purpose": "create"},
+        "upload": {"kind": "css", "value": "input[type=file]", "purpose": "upload"},
+        "title": {"kind": "label", "value": "Title", "purpose": "title"},
+        "description": {"kind": "label", "value": "Description", "purpose": "description"},
+        "caption": {"kind": "label", "value": "Description", "purpose": "caption"},
+        "audience_made_for_kids": {"kind": "label", "value": "Yes, it's made for kids", "purpose": "audience_made_for_kids"},
+        "audience_not_made_for_kids": {"kind": "label", "value": "No, it's not made for kids", "purpose": "audience_not_made_for_kids"},
+        "synthetic_media": {"kind": "label", "value": "Altered content", "purpose": "synthetic_media"},
+        "visibility": {"kind": "label", "value": "Visibility", "purpose": "visibility"},
+        "scheduled_at": {"kind": "label", "value": "Schedule", "purpose": "scheduled_at"},
+        "submit": {"kind": "role", "value": "button", "name": "Publish", "purpose": "submit"},
+        "confirmation": {"kind": "text", "value": "Video published", "purpose": "confirmation"},
+        "permalink": {"kind": "role", "value": "link", "name": "Video link", "purpose": "permalink"},
+        "platform_id": {"kind": "label", "value": "Video ID", "purpose": "platform_id"}
+      }
+    },
+    "x": {
+      "url": "https://x.com/compose/post",
+      "login_markers": ["Sign in to X", "Log in to X"],
+      "post_link_pattern": "https://(?:www\\.)?x\\.com/[^/]+/status/[0-9]+(?:\\?.*)?",
+      "supports_schedule": false,
+      "before_upload": [],
+      "after_upload": ["processing"],
+      "locators": {
+        "identity": {"kind": "label", "value": "Account menu", "purpose": "identity"},
+        "upload": {"kind": "css", "value": "input[type=file]", "purpose": "upload"},
+        "processing": {"kind": "text", "value": "Uploaded", "purpose": "processing"},
+        "caption": {"kind": "label", "value": "Post text", "purpose": "caption"},
+        "submit": {"kind": "role", "value": "button", "name": "Post", "purpose": "submit"},
+        "confirmation": {"kind": "text", "value": "Your post was sent", "purpose": "confirmation"},
+        "permalink": {"kind": "role", "value": "link", "name": "View", "purpose": "permalink"},
+        "platform_id": {"kind": "label", "value": "Post ID", "purpose": "platform_id"}
+      }
+    },
+    "facebook": {
+      "url": "https://www.facebook.com/reels/create/",
+      "login_markers": ["Log into Facebook", "Forgotten password"],
+      "post_link_pattern": "https://(?:www\\.)?facebook\\.com/(?:reel|[^/]+/videos)/[A-Za-z0-9._-]+/?(?:\\?.*)?",
+      "supports_schedule": true,
+      "before_upload": [],
+      "after_upload": [],
+      "locators": {
+        "identity": {"kind": "label", "value": "Your profile", "purpose": "identity"},
+        "upload": {"kind": "css", "value": "input[type=file]", "purpose": "upload"},
+        "caption": {"kind": "label", "value": "Describe your reel", "purpose": "caption"},
+        "scheduled_at": {"kind": "label", "value": "Schedule", "purpose": "scheduled_at"},
+        "submit": {"kind": "role", "value": "button", "name": "Publish", "purpose": "submit"},
+        "confirmation": {"kind": "text", "value": "Your reel is being published", "purpose": "confirmation"},
+        "permalink": {"kind": "role", "value": "link", "name": "View reel", "purpose": "permalink"},
+        "platform_id": {"kind": "label", "value": "Reel ID", "purpose": "platform_id"}
+      }
+    },
+    "threads": {
+      "url": "https://www.threads.net/",
+      "login_markers": ["Log in with Instagram", "Log in"],
+      "post_link_pattern": "https://(?:www\\.)?threads\\.(?:net|com)/@[^/]+/post/[A-Za-z0-9_-]+/?(?:\\?.*)?",
+      "supports_schedule": false,
+      "before_upload": ["create"],
+      "after_upload": [],
+      "locators": {
+        "identity": {"kind": "label", "value": "Profile", "purpose": "identity"},
+        "create": {"kind": "role", "value": "button", "name": "Create", "purpose": "create"},
+        "upload": {"kind": "css", "value": "input[type=file]", "purpose": "upload"},
+        "caption": {"kind": "label", "value": "Start a thread", "purpose": "caption"},
+        "submit": {"kind": "role", "value": "button", "name": "Post", "purpose": "submit"},
+        "confirmation": {"kind": "text", "value": "Posted", "purpose": "confirmation"},
+        "permalink": {"kind": "role", "value": "link", "name": "View thread", "purpose": "permalink"},
+        "platform_id": {"kind": "label", "value": "Thread ID", "purpose": "platform_id"}
+      }
+    }
+  }
+}
