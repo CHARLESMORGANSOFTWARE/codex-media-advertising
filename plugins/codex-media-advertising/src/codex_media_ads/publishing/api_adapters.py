@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import mimetypes
 import os
+import re
+import secrets
 import stat
 import time
 from pathlib import Path
 from typing import Callable, Mapping, Protocol
+from urllib.parse import parse_qsl, quote, urlsplit
 
 import requests
 
@@ -31,6 +37,22 @@ class _ApiFailure(RuntimeError):
     def __init__(self, detail: str, *, category: ErrorCategory = ErrorCategory.NETWORK):
         super().__init__(redact_diagnostic(detail))
         self.category = category
+
+
+class _AmbiguousSubmit(RuntimeError):
+    pass
+
+
+def _is_connection_loss(exc: BaseException) -> bool:
+    return isinstance(
+        exc,
+        (
+            TimeoutError,
+            ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+        ),
+    )
 
 
 def _read_secret(account: AccountConfig) -> dict[str, object]:
@@ -160,6 +182,95 @@ def _failed(exc: BaseException, *, upload_started: bool) -> PublishResult:
             # could duplicate publication. The orchestrator must reconcile first.
             "retry_safe": not upload_started,
         },
+    )
+
+
+def _unknown(exc: BaseException) -> PublishResult:
+    return PublishResult(
+        status=PublishStatus.UNKNOWN,
+        error_category=ErrorCategory.AMBIGUOUS_SUBMIT.value,
+        detail=redact_diagnostic(str(exc) or "final submit response was not received"),
+        evidence={"upload_started": True, "retry_safe": False},
+    )
+
+
+def _final_request_json(
+    transport: HttpTransport,
+    method: str,
+    url: str,
+    operation: str,
+    **kwargs: object,
+) -> dict[str, object]:
+    try:
+        response = transport.request(method, url, timeout=30, **kwargs)
+    except Exception as exc:
+        if _is_connection_loss(exc):
+            raise _AmbiguousSubmit(
+                f"{operation} may have reached the platform; reconcile before retrying: {exc}"
+            ) from exc
+        raise _ApiFailure(f"{operation} request failed: {exc}") from exc
+    return _response_json(response, operation)
+
+
+def _oauth_encode(value: object) -> str:
+    return quote(str(value), safe="~-._")
+
+
+def _oauth1_authorization(
+    *,
+    method: str,
+    url: str,
+    consumer_key: str,
+    consumer_secret: str,
+    access_token: str,
+    access_token_secret: str,
+    nonce: str,
+    timestamp: int,
+    query: Mapping[str, object] | None = None,
+    form: Mapping[str, object] | None = None,
+) -> str:
+    """Build an RFC 5849 HMAC-SHA1 user-context Authorization header."""
+
+    parts = urlsplit(url)
+    base_url = f"{parts.scheme}://{parts.netloc}{parts.path}"
+    oauth = {
+        "oauth_consumer_key": consumer_key,
+        "oauth_nonce": nonce,
+        "oauth_signature_method": "HMAC-SHA1",
+        "oauth_timestamp": str(timestamp),
+        "oauth_token": access_token,
+        "oauth_version": "1.0",
+    }
+    parameters: list[tuple[str, str]] = [
+        (str(key), str(value)) for key, value in parse_qsl(parts.query, keep_blank_values=True)
+    ]
+    for source in (query or {}, form or {}, oauth):
+        for key, value in source.items():
+            if isinstance(value, (list, tuple)):
+                parameters.extend((str(key), str(item)) for item in value)
+            else:
+                parameters.append((str(key), str(value)))
+    encoded_parameters = sorted(
+        (_oauth_encode(key), _oauth_encode(value)) for key, value in parameters
+    )
+    normalized = "&".join(
+        f"{key}={value}" for key, value in encoded_parameters
+    )
+    signature_base = "&".join(
+        (_oauth_encode(method.upper()), _oauth_encode(base_url), _oauth_encode(normalized))
+    )
+    signing_key = f"{_oauth_encode(consumer_secret)}&{_oauth_encode(access_token_secret)}"
+    signature = base64.b64encode(
+        hmac.new(
+            signing_key.encode("ascii"),
+            signature_base.encode("ascii"),
+            hashlib.sha1,
+        ).digest()
+    ).decode("ascii")
+    oauth["oauth_signature"] = signature
+    return "OAuth " + ", ".join(
+        f'{_oauth_encode(key)}="{_oauth_encode(value)}"'
+        for key, value in sorted(oauth.items())
     )
 
 
@@ -294,6 +405,8 @@ class MetaPublisher(_PublisherBase):
             if self.platform == "instagram":
                 return self._publish_instagram(request, secret)
             return self._publish_facebook(request, secret)
+        except _AmbiguousSubmit as exc:
+            return _unknown(exc)
         except Exception as exc:
             if isinstance(exc, _ApiFailure) and exc.category in {
                 ErrorCategory.CONFIGURATION,
@@ -309,20 +422,21 @@ class MetaPublisher(_PublisherBase):
     def _upload_bytes(
         self, upload_url: str, media_path: Path, token: object, operation: str
     ) -> dict[str, object]:
-        media = media_path.read_bytes()
-        return _request_json(
-            self.transport,
-            "POST",
-            upload_url,
-            operation,
-            headers={
-                "Authorization": f"OAuth {token}",
-                "offset": "0",
-                "file_size": str(len(media)),
-                "Content-Type": "application/octet-stream",
-            },
-            data=media,
-        )
+        size = media_path.stat().st_size
+        with media_path.open("rb") as media:
+            return _request_json(
+                self.transport,
+                "POST",
+                upload_url,
+                operation,
+                headers={
+                    "Authorization": f"OAuth {token}",
+                    "offset": "0",
+                    "file_size": str(size),
+                    "Content-Type": "application/octet-stream",
+                },
+                data=media,
+            )
 
     def _publish_instagram(
         self, request: PublishRequest, secret: Mapping[str, object]
@@ -353,7 +467,7 @@ class MetaPublisher(_PublisherBase):
             upload_url, request.media_path, secret["access_token"], "Instagram upload"
         )
         self._poll_meta_instagram(base, creation_id, secret["access_token"])
-        published = _request_json(
+        published = _final_request_json(
             self.transport,
             "POST",
             f"{base}/{destination}/media_publish",
@@ -427,7 +541,7 @@ class MetaPublisher(_PublisherBase):
             upload_url, request.media_path, secret["access_token"], "Facebook upload"
         )
         self._poll_meta_facebook(base, video_id, secret["access_token"])
-        finish = _request_json(
+        finish = _final_request_json(
             self.transport,
             "POST",
             f"{base}/{destination}/video_reels",
@@ -440,7 +554,7 @@ class MetaPublisher(_PublisherBase):
                 "description": str(request.metadata.get("caption", "")),
             },
         )
-        published_id = str(finish.get("id") or video_id) if finish.get("success") else ""
+        published_id = str(finish.get("id", "")) if finish.get("success") else ""
         if not published_id:
             raise _ApiFailure("Facebook publish did not return positive success evidence")
         evidence: dict[str, object] = {"video_id": video_id}
@@ -491,6 +605,23 @@ class MetaPublisher(_PublisherBase):
 
 class YouTubePublisher(_PublisherBase):
     platform = "youtube"
+
+    def __init__(
+        self,
+        transport: HttpTransport | None = None,
+        *,
+        chunk_size: int = 8 * 1024 * 1024,
+        max_resume_attempts: int = 3,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        super().__init__(transport)
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be positive")
+        if max_resume_attempts < 1:
+            raise ValueError("max_resume_attempts must be positive")
+        self.chunk_size = chunk_size
+        self.max_resume_attempts = max_resume_attempts
+        self.sleep = sleep
 
     def _probe(self, account: AccountConfig, secret: Mapping[str, object]) -> ProbeResult:
         scopes = secret.get("scopes", [])
@@ -555,7 +686,11 @@ class YouTubePublisher(_PublisherBase):
                 },
                 "status": status,
             }
-            media = request.media_path.read_bytes()
+            media_size = request.media_path.stat().st_size
+            if media_size < 1:
+                raise _ApiFailure(
+                    "YouTube media file is empty", category=ErrorCategory.VALIDATION
+                )
             content_type = mimetypes.guess_type(request.media_path.name)[0] or "video/mp4"
             upload_started = True
             try:
@@ -565,7 +700,7 @@ class YouTubePublisher(_PublisherBase):
                     timeout=30,
                     headers={
                         "Authorization": f"Bearer {secret['access_token']}",
-                        "X-Upload-Content-Length": str(len(media)),
+                        "X-Upload-Content-Length": str(media_size),
                         "X-Upload-Content-Type": content_type,
                         "Content-Type": "application/json; charset=UTF-8",
                     },
@@ -578,13 +713,12 @@ class YouTubePublisher(_PublisherBase):
             location = str(getattr(initiation, "headers", {}).get("Location", ""))
             if not location:
                 raise _ApiFailure("YouTube did not return a resumable upload location")
-            uploaded = _request_json(
-                self.transport,
-                "PUT",
-                location,
-                "YouTube media upload",
-                headers={"Content-Type": content_type, "Content-Length": str(len(media))},
-                data=media,
+            uploaded = self._upload_resumable(
+                location=location,
+                media_path=request.media_path,
+                media_size=media_size,
+                content_type=content_type,
+                access_token=str(secret["access_token"]),
             )
             video_id = str(uploaded.get("id", ""))
             actual_status = uploaded.get("status", {})
@@ -607,6 +741,8 @@ class YouTubePublisher(_PublisherBase):
                     "upload_scope": YOUTUBE_UPLOAD_SCOPE,
                 },
             )
+        except _AmbiguousSubmit as exc:
+            return _unknown(exc)
         except Exception as exc:
             if isinstance(exc, _ApiFailure) and exc.category in {
                 ErrorCategory.CONFIGURATION,
@@ -619,6 +755,140 @@ class YouTubePublisher(_PublisherBase):
                 )
             return _failed(exc, upload_started=upload_started)
 
+    @staticmethod
+    def _resume_offset(response: object, total: int) -> int:
+        range_value = str(getattr(response, "headers", {}).get("Range", ""))
+        match = re.fullmatch(r"(?:bytes=)?0-(\d+)", range_value.strip())
+        if not match:
+            return 0
+        return min(int(match.group(1)) + 1, total)
+
+    def _query_upload_status(
+        self,
+        *,
+        location: str,
+        media_size: int,
+        access_token: str,
+        final_chunk_was_sent: bool,
+    ) -> tuple[int, dict[str, object] | None]:
+        last_error: BaseException | None = None
+        for attempt in range(self.max_resume_attempts):
+            if attempt:
+                self.sleep(min(2**attempt, 8))
+            try:
+                response = self.transport.request(
+                    "PUT",
+                    location,
+                    timeout=30,
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Length": "0",
+                        "Content-Range": f"bytes */{media_size}",
+                    },
+                    data=b"",
+                )
+            except Exception as exc:
+                if not _is_connection_loss(exc):
+                    raise _ApiFailure(
+                        f"YouTube upload status request failed: {exc}"
+                    ) from exc
+                last_error = exc
+                continue
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            if status_code == 308:
+                return self._resume_offset(response, media_size), None
+            if 200 <= status_code < 300:
+                return media_size, _response_json(
+                    response, "YouTube upload status reconciliation"
+                )
+            if status_code in {500, 502, 503, 504}:
+                last_error = _ApiFailure(
+                    f"YouTube upload status returned HTTP {status_code}"
+                )
+                continue
+            _response_json(response, "YouTube upload status reconciliation")
+        if final_chunk_was_sent:
+            raise _AmbiguousSubmit(
+                f"YouTube final upload response could not be reconciled: {last_error or 'status unavailable'}"
+            )
+        raise _ApiFailure(
+            f"YouTube upload status could not be reconciled: {last_error or 'status unavailable'}"
+        )
+
+    def _upload_resumable(
+        self,
+        *,
+        location: str,
+        media_path: Path,
+        media_size: int,
+        content_type: str,
+        access_token: str,
+    ) -> dict[str, object]:
+        offset = 0
+        stalled_responses = 0
+        with media_path.open("rb") as media:
+            while offset < media_size:
+                media.seek(offset)
+                chunk = media.read(min(self.chunk_size, media_size - offset))
+                if not chunk:
+                    raise _ApiFailure("YouTube media ended before its declared size")
+                end = offset + len(chunk) - 1
+                final_chunk = end + 1 == media_size
+                headers = {
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Length": str(len(chunk)),
+                    "Content-Type": content_type,
+                    "Content-Range": f"bytes {offset}-{end}/{media_size}",
+                }
+                try:
+                    response = self.transport.request(
+                        "PUT",
+                        location,
+                        timeout=30,
+                        headers=headers,
+                        data=chunk,
+                    )
+                except Exception as exc:
+                    if not _is_connection_loss(exc):
+                        raise _ApiFailure(f"YouTube media upload failed: {exc}") from exc
+                    offset, completed = self._query_upload_status(
+                        location=location,
+                        media_size=media_size,
+                        access_token=access_token,
+                        final_chunk_was_sent=final_chunk,
+                    )
+                    if completed is not None:
+                        return completed
+                    continue
+
+                status_code = int(getattr(response, "status_code", 0) or 0)
+                if status_code == 308:
+                    next_offset = self._resume_offset(response, media_size)
+                    if next_offset <= offset:
+                        stalled_responses += 1
+                        if stalled_responses >= self.max_resume_attempts:
+                            raise _ApiFailure(
+                                "YouTube resumable upload made no progress before the retry limit"
+                            )
+                    else:
+                        stalled_responses = 0
+                    offset = next_offset
+                    continue
+                if status_code in {500, 502, 503, 504}:
+                    offset, completed = self._query_upload_status(
+                        location=location,
+                        media_size=media_size,
+                        access_token=access_token,
+                        final_chunk_was_sent=final_chunk,
+                    )
+                    if completed is not None:
+                        return completed
+                    continue
+                if 200 <= status_code < 300:
+                    return _response_json(response, "YouTube media upload")
+                _response_json(response, "YouTube media upload")
+        raise _ApiFailure("YouTube upload ended without a completion response")
+
 
 class XPublisher(_PublisherBase):
     platform = "x"
@@ -630,6 +900,8 @@ class XPublisher(_PublisherBase):
         chunk_size: int = 4 * 1024 * 1024,
         sleep: Callable[[float], None] = time.sleep,
         max_poll_attempts: int = 20,
+        nonce_factory: Callable[[], str] | None = None,
+        timestamp_factory: Callable[[], int] | None = None,
     ) -> None:
         super().__init__(transport)
         if chunk_size < 1:
@@ -637,21 +909,80 @@ class XPublisher(_PublisherBase):
         self.chunk_size = chunk_size
         self.sleep = sleep
         self.max_poll_attempts = max(1, max_poll_attempts)
+        self.nonce_factory = nonce_factory or (lambda: secrets.token_hex(16))
+        self.timestamp_factory = timestamp_factory or (lambda: int(time.time()))
 
-    def _headers(self, secret: Mapping[str, object]) -> dict[str, str]:
-        return {"Authorization": f"Bearer {secret['access_token']}"}
+    @staticmethod
+    def _credentials(secret: Mapping[str, object]) -> dict[str, str]:
+        names = (
+            "consumer_key",
+            "consumer_secret",
+            "access_token",
+            "access_token_secret",
+        )
+        values: dict[str, str] = {}
+        for name in names:
+            value = secret.get(name)
+            if not isinstance(value, str) or not value.strip():
+                raise _ApiFailure(
+                    f"X OAuth 1.0a credential {name} is not configured",
+                    category=ErrorCategory.CONFIGURATION,
+                )
+            values[name] = value
+        return values
+
+    def _x_request(
+        self,
+        secret: Mapping[str, object],
+        method: str,
+        url: str,
+        operation: str,
+        *,
+        params: Mapping[str, object] | None = None,
+        data: Mapping[str, object] | None = None,
+        files: Mapping[str, object] | None = None,
+        json_body: Mapping[str, object] | None = None,
+        final_mutation: bool = False,
+    ) -> dict[str, object]:
+        credentials = self._credentials(secret)
+        # OAuth 1.0a signs URL query parameters and form-encoded bodies. Multipart
+        # and JSON bodies are intentionally excluded from the signature base.
+        form = data if data is not None and files is None and json_body is None else None
+        authorization = _oauth1_authorization(
+            method=method,
+            url=url,
+            **credentials,
+            nonce=self.nonce_factory(),
+            timestamp=self.timestamp_factory(),
+            query=params,
+            form=form,
+        )
+        headers = {"Authorization": authorization}
+        kwargs: dict[str, object] = {"headers": headers}
+        if params is not None:
+            kwargs["params"] = dict(params)
+        if data is not None:
+            kwargs["data"] = dict(data)
+        if files is not None:
+            kwargs["files"] = dict(files)
+        if json_body is not None:
+            headers["Content-Type"] = "application/json"
+            kwargs["json"] = dict(json_body)
+        requester = _final_request_json if final_mutation else _request_json
+        return requester(self.transport, method, url, operation, **kwargs)
 
     def _probe(self, account: AccountConfig, secret: Mapping[str, object]) -> ProbeResult:
-        payload = _request_json(
-            self.transport,
+        payload = self._x_request(
+            secret,
             "GET",
-            "https://api.x.com/2/users/me",
+            "https://api.x.com/1.1/account/verify_credentials.json",
             "X identity probe",
-            headers=self._headers(secret),
-            params={"user.fields": "username"},
+            params={"skip_status": "true", "include_email": "false"},
         )
         data = payload.get("data", {})
-        observed = str(data.get("username", "")) if isinstance(data, dict) else ""
+        observed = str(payload.get("screen_name", ""))
+        if not observed and isinstance(data, dict):
+            observed = str(data.get("username", ""))
         identity = probe_identity(account.expected_identity, observed)
         return ProbeResult(
             authenticated=identity.ok,
@@ -690,19 +1021,21 @@ class XPublisher(_PublisherBase):
                     status=PublishStatus.SKIPPED,
                     evidence={"dry_run": True, "observed_identity": probe.observed_identity},
                 )
-            media = request.media_path.read_bytes()
-            headers = self._headers(secret)
+            media_size = request.media_path.stat().st_size
+            if media_size < 1:
+                raise _ApiFailure(
+                    "X media file is empty", category=ErrorCategory.VALIDATION
+                )
             upload_url = "https://upload.twitter.com/1.1/media/upload.json"
             upload_started = True
-            initialized = _request_json(
-                self.transport,
+            initialized = self._x_request(
+                secret,
                 "POST",
                 upload_url,
                 "X media upload initialization",
-                headers=headers,
                 data={
                     "command": "INIT",
-                    "total_bytes": len(media),
+                    "total_bytes": media_size,
                     "media_type": mimetypes.guess_type(request.media_path.name)[0]
                     or "video/mp4",
                     "media_category": "tweet_video",
@@ -711,31 +1044,35 @@ class XPublisher(_PublisherBase):
             media_id = self._media_id(initialized)
             if not media_id:
                 raise _ApiFailure("X did not return a media ID")
-            for index, offset in enumerate(range(0, len(media), self.chunk_size)):
-                _request_json(
-                    self.transport,
-                    "POST",
-                    upload_url,
-                    "X media chunk upload",
-                    headers=headers,
-                    data={
-                        "command": "APPEND",
-                        "media_id": media_id,
-                        "segment_index": index,
-                    },
-                    files={"media": (request.media_path.name, media[offset : offset + self.chunk_size])},
-                )
-            finalized = _request_json(
-                self.transport,
+            with request.media_path.open("rb") as media:
+                index = 0
+                while True:
+                    chunk = media.read(self.chunk_size)
+                    if not chunk:
+                        break
+                    self._x_request(
+                        secret,
+                        "POST",
+                        upload_url,
+                        "X media chunk upload",
+                        data={
+                            "command": "APPEND",
+                            "media_id": media_id,
+                            "segment_index": index,
+                        },
+                        files={"media": (request.media_path.name, chunk)},
+                    )
+                    index += 1
+            finalized = self._x_request(
+                secret,
                 "POST",
                 upload_url,
                 "X media upload finalize",
-                headers=headers,
                 data={"command": "FINALIZE", "media_id": media_id},
             )
             processing = self._processing(finalized)
             if processing:
-                self._poll_processing(upload_url, headers, media_id, processing)
+                self._poll_processing(secret, upload_url, media_id, processing)
             body: dict[str, object] = {
                 "text": str(request.metadata.get("caption", "")),
                 "media": {"media_ids": [media_id]},
@@ -743,13 +1080,13 @@ class XPublisher(_PublisherBase):
             for disclosure in ("made_with_ai", "paid_partnership"):
                 if disclosure in request.metadata:
                     body[disclosure] = bool(request.metadata[disclosure])
-            created = _request_json(
-                self.transport,
+            created = self._x_request(
+                secret,
                 "POST",
                 "https://api.x.com/2/tweets",
                 "X post creation",
-                headers={**headers, "Content-Type": "application/json"},
-                json=body,
+                json_body=body,
+                final_mutation=True,
             )
             data = created.get("data", {})
             post_id = str(data.get("id", "")) if isinstance(data, dict) else ""
@@ -761,6 +1098,8 @@ class XPublisher(_PublisherBase):
                 post_url=f"https://x.com/i/web/status/{post_id}",
                 evidence={"media_id": media_id},
             )
+        except _AmbiguousSubmit as exc:
+            return _unknown(exc)
         except Exception as exc:
             if isinstance(exc, _ApiFailure) and exc.category in {
                 ErrorCategory.CONFIGURATION,
@@ -775,8 +1114,8 @@ class XPublisher(_PublisherBase):
 
     def _poll_processing(
         self,
+        secret: Mapping[str, object],
         upload_url: str,
-        headers: Mapping[str, str],
         media_id: str,
         processing: Mapping[str, object],
     ) -> None:
@@ -788,12 +1127,11 @@ class XPublisher(_PublisherBase):
             if state in {"failed", "error"}:
                 raise _ApiFailure("X media processing failed")
             self.sleep(float(current.get("check_after_secs", 1) or 0))
-            payload = _request_json(
-                self.transport,
+            payload = self._x_request(
+                secret,
                 "GET",
                 upload_url,
                 "X media processing status",
-                headers=dict(headers),
                 params={"command": "STATUS", "media_id": media_id},
             )
             current = self._processing(payload)

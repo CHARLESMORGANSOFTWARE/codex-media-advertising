@@ -111,6 +111,26 @@ def test_explicit_route_must_pass_probe() -> None:
         router.select(_account("api"), "x")
 
 
+def test_route_error_redacts_arbitrary_probe_detail() -> None:
+    from codex_media_ads.publishing.router import PublisherRouter, RouteUnavailableError
+
+    adapter = FakeAdapter(
+        "x",
+        ProbeResult(
+            authenticated=False,
+            detail="access_token=top-secret and authorization: Bearer hidden",
+        ),
+    )
+    router = PublisherRouter(api_adapters={"x": adapter}, browser_adapters={})
+
+    with pytest.raises(RouteUnavailableError) as raised:
+        router.select(_account("api"), "x")
+
+    assert "top-secret" not in str(raised.value)
+    assert "Bearer hidden" not in str(raised.value)
+    assert "[REDACTED]" in str(raised.value)
+
+
 def test_explicit_route_wraps_probe_exception_as_unavailable() -> None:
     from codex_media_ads.publishing.router import PublisherRouter, RouteUnavailableError
 

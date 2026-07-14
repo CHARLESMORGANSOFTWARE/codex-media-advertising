@@ -49,6 +49,9 @@ class QueueTransport:
 def _secret_file(tmp_path: Path, **overrides: object) -> Path:
     data: dict[str, object] = {
         "access_token": "top-secret-token",
+        "access_token_secret": "top-secret-access-secret",
+        "consumer_key": "test-consumer-key",
+        "consumer_secret": "top-secret-consumer-secret",
         "api_version": "v23.0",
         "destination_ids": {
             "instagram": "ig-destination-1",
@@ -173,6 +176,50 @@ def test_meta_uses_separate_facebook_destination_and_finish_contract(
     assert finish[2]["data"]["video_state"] == "PUBLISHED"
 
 
+def test_facebook_finish_must_return_a_published_id(tmp_path: Path) -> None:
+    from codex_media_ads.publishing.api_adapters import MetaPublisher
+
+    transport = QueueTransport(
+        [
+            FakeResponse({"id": "fb-destination-1", "name": "expected-account"}),
+            FakeResponse({"video_id": "upload-session-1", "upload_url": "https://upload.example"}),
+            FakeResponse({"success": True}),
+            FakeResponse({"status": {"video_status": "ready"}}),
+            FakeResponse({"success": True}),
+        ]
+    )
+
+    result = MetaPublisher("facebook", transport, sleep=lambda _seconds: None).publish(
+        _request(tmp_path, platform="facebook")
+    )
+
+    assert result.status == "failed"
+    assert result.platform_id == ""
+
+
+def test_meta_final_publish_timeout_is_ambiguous_unknown(tmp_path: Path) -> None:
+    from codex_media_ads.publishing.api_adapters import MetaPublisher
+
+    transport = QueueTransport(
+        [
+            FakeResponse({"id": "ig-destination-1", "username": "expected-account"}),
+            FakeResponse({"id": "creation-1"}),
+            FakeResponse({"success": True}),
+            FakeResponse({"status_code": "FINISHED"}),
+            TimeoutError("access_token=must-not-leak"),
+        ]
+    )
+
+    result = MetaPublisher("instagram", transport, sleep=lambda _seconds: None).publish(
+        _request(tmp_path, platform="instagram")
+    )
+
+    assert result.status == "unknown"
+    assert result.error_category == "ambiguous_submit"
+    assert result.evidence["retry_safe"] is False
+    assert "must-not-leak" not in result.model_dump_json()
+
+
 def test_youtube_reports_requested_and_actual_upload_evidence(tmp_path: Path) -> None:
     from codex_media_ads.publishing.api_adapters import YouTubePublisher
 
@@ -244,6 +291,57 @@ def test_youtube_reports_requested_and_actual_upload_evidence(tmp_path: Path) ->
     }
 
 
+def test_youtube_upload_put_is_authorized_and_resumes_from_308_range(
+    tmp_path: Path,
+) -> None:
+    from codex_media_ads.publishing.api_adapters import YouTubePublisher
+
+    transport = QueueTransport(
+        [
+            FakeResponse({"items": [{"snippet": {"title": "expected-account"}}]}),
+            EmptyResponse(headers={"Location": "https://upload.example/session-1"}),
+            EmptyResponse(status_code=308, headers={"Range": "bytes=0-3"}),
+            FakeResponse({"id": "video-1", "status": {"privacyStatus": "private"}}, status_code=201),
+        ]
+    )
+
+    result = YouTubePublisher(transport).publish(
+        _request(tmp_path, platform="youtube", metadata={"title": "A title"})
+    )
+
+    assert result.status == "submitted"
+    puts = [call for call in transport.calls if call[0] == "PUT"]
+    assert len(puts) == 2
+    assert all(call[2]["headers"]["Authorization"] == "Bearer top-secret-token" for call in puts)
+    assert puts[0][2]["headers"]["Content-Range"] == "bytes 0-9/10"
+    assert puts[1][2]["headers"]["Content-Range"] == "bytes 4-9/10"
+    assert puts[1][2]["data"] == b"efghij"
+
+
+def test_youtube_final_chunk_timeout_without_reconciliation_is_unknown(
+    tmp_path: Path,
+) -> None:
+    from codex_media_ads.publishing.api_adapters import YouTubePublisher
+
+    transport = QueueTransport(
+        [
+            FakeResponse({"items": [{"snippet": {"title": "expected-account"}}]}),
+            EmptyResponse(headers={"Location": "https://upload.example/session-1"}),
+            TimeoutError("final upload timed out"),
+            TimeoutError("status unavailable"),
+        ]
+    )
+
+    result = YouTubePublisher(transport, max_resume_attempts=1).publish(
+        _request(tmp_path, platform="youtube", metadata={"title": "A title"})
+    )
+
+    assert result.status == "unknown"
+    assert result.error_category == "ambiguous_submit"
+    assert result.evidence["retry_safe"] is False
+    assert len([call for call in transport.calls if call[0] == "PUT"]) == 2
+
+
 def test_x_uploads_chunks_polls_and_creates_post_with_disclosures(
     tmp_path: Path,
 ) -> None:
@@ -307,6 +405,121 @@ def test_x_uploads_chunks_polls_and_creates_post_with_disclosures(
         "made_with_ai": True,
         "paid_partnership": True,
     }
+    assert all(
+        str(call[2]["headers"]["Authorization"]).startswith("OAuth ")
+        for call in transport.calls
+    )
+    assert all(
+        "Bearer " not in str(call[2]["headers"]["Authorization"])
+        for call in transport.calls
+    )
+
+
+def test_x_oauth1_header_contains_user_context_contract(tmp_path: Path) -> None:
+    from codex_media_ads.publishing.api_adapters import XPublisher
+
+    transport = QueueTransport(
+        [FakeResponse({"screen_name": "expected-account", "id_str": "user-1"})]
+    )
+    adapter = XPublisher(
+        transport,
+        nonce_factory=lambda: "fixed-nonce",
+        timestamp_factory=lambda: 1_700_000_000,
+    )
+
+    probe = adapter.probe_auth(_request(tmp_path, platform="x").account)
+
+    assert probe.authenticated is True
+    method, url, kwargs = transport.calls[0]
+    authorization = str(kwargs["headers"]["Authorization"])
+    assert method == "GET"
+    assert url.endswith("/1.1/account/verify_credentials.json")
+    assert authorization.startswith("OAuth ")
+    assert 'oauth_consumer_key="test-consumer-key"' in authorization
+    assert 'oauth_token="top-secret-token"' in authorization
+    assert 'oauth_nonce="fixed-nonce"' in authorization
+    assert 'oauth_signature_method="HMAC-SHA1"' in authorization
+    assert "top-secret-access-secret" not in authorization
+    assert "top-secret-consumer-secret" not in authorization
+
+
+def test_x_oauth1_signer_matches_reference_hmac_sha1_vector() -> None:
+    from codex_media_ads.publishing.api_adapters import _oauth1_authorization
+
+    authorization = _oauth1_authorization(
+        method="GET",
+        url="http://photos.example.net/photos",
+        consumer_key="dpf43f3p2l4k3l03",
+        consumer_secret="kd94hf93k423kf44",
+        access_token="nnch734d00sl2jdk",
+        access_token_secret="pfkkdhi9sl3r4s00",
+        nonce="kllo9940pd9333jh",
+        timestamp=1_191_242_096,
+        query={"file": "vacation.jpg", "size": "original"},
+    )
+
+    assert 'oauth_signature="tR3%2BTy81lMeYAr%2FFid0kMTYa%2FWM%3D"' in authorization
+
+
+def test_x_tweet_timeout_is_ambiguous_unknown(tmp_path: Path) -> None:
+    from codex_media_ads.publishing.api_adapters import XPublisher
+
+    transport = QueueTransport(
+        [
+            FakeResponse({"screen_name": "expected-account", "id_str": "user-1"}),
+            FakeResponse({"media_id_string": "media-1"}),
+            EmptyResponse(status_code=204),
+            FakeResponse({"media_id_string": "media-1"}),
+            ConnectionError("oauth_token_secret=must-not-leak"),
+        ]
+    )
+
+    result = XPublisher(transport, chunk_size=20).publish(
+        _request(tmp_path, platform="x")
+    )
+
+    assert result.status == "unknown"
+    assert result.error_category == "ambiguous_submit"
+    assert result.evidence["retry_safe"] is False
+    assert "must-not-leak" not in result.model_dump_json()
+
+
+@pytest.mark.parametrize("publisher_name", ["youtube", "x"])
+def test_large_video_publishers_do_not_use_path_read_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, publisher_name: str
+) -> None:
+    from codex_media_ads.publishing.api_adapters import YouTubePublisher, XPublisher
+
+    def forbidden_read_bytes(_path: Path) -> bytes:
+        raise AssertionError("whole-file read is forbidden")
+
+    monkeypatch.setattr(Path, "read_bytes", forbidden_read_bytes)
+    if publisher_name == "youtube":
+        transport = QueueTransport(
+            [
+                FakeResponse({"items": [{"snippet": {"title": "expected-account"}}]}),
+                EmptyResponse(headers={"Location": "https://upload.example/session"}),
+                FakeResponse({"id": "video-1", "status": {"privacyStatus": "private"}}, status_code=201),
+            ]
+        )
+        result = YouTubePublisher(transport).publish(
+            _request(tmp_path, platform="youtube", metadata={"title": "title"})
+        )
+    else:
+        transport = QueueTransport(
+            [
+                FakeResponse({"screen_name": "expected-account"}),
+                FakeResponse({"media_id_string": "media-1"}),
+                EmptyResponse(status_code=204),
+                FakeResponse({"media_id_string": "media-1"}),
+                FakeResponse({"data": {"id": "post-1"}}),
+            ]
+        )
+        result = XPublisher(transport, chunk_size=20).publish(
+            _request(tmp_path, platform="x")
+        )
+
+    assert result.status in {"submitted", "published"}
 
 
 def test_x_accepts_empty_204_append_responses(tmp_path: Path) -> None:

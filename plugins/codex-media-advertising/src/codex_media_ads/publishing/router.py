@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from ..models import AccountConfig
-from .base import PublisherAdapter
+from .base import PublisherAdapter, redact_diagnostic
 
 
 class RouteUnavailableError(RuntimeError):
@@ -41,7 +41,7 @@ class PublisherRouter:
                 f"{route} authentication probe failed for {platform}"
             ) from exc
         if not probe.authenticated:
-            detail = f": {probe.detail}" if probe.detail else ""
+            detail = f": {redact_diagnostic(probe.detail)}" if probe.detail else ""
             raise RouteUnavailableError(
                 f"{route} authentication probe failed for {platform}{detail}"
             )
