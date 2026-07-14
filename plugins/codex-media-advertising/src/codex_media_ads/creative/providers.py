@@ -60,7 +60,10 @@ class CodimageProvider:
         self.job_file = Path(
             job_file or self.project_root / "codimage-jobs.jsonl"
         ).resolve()
-        self.command_identity = [*self.executable_prefix, "batch"]
+
+    @property
+    def command_identity(self) -> list[str]:
+        return self._invocation()
 
     def make_job(self, prompt: str, output_path: Path) -> dict[str, str]:
         return {"prompt": prompt, "out": str(Path(output_path).resolve())}

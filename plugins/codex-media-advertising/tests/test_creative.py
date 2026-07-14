@@ -254,6 +254,10 @@ def fake_variant(master, output, **kwargs):
     return output
 
 
+fake_master.cache_identity = "fake-master-v1"
+fake_variant.cache_identity = "fake-variant-v1"
+
+
 @pytest.fixture
 def pipeline(tmp_path: Path):
     return CreativePipeline(
@@ -323,6 +327,266 @@ def test_build_manifest_has_campaign_input_command_audio_and_output_hashes(
     assert manifest["stages"]["render"]["output_hash"] == hashlib.sha256(
         result.master_path.read_bytes()
     ).hexdigest()
+
+
+class ExplodingNarration:
+    command_identity = ["exploding-narration-v1"]
+
+    def synthesize(self, text: str, output_path: Path, voice: str) -> Path:
+        raise RuntimeError("password=hunter2")
+
+
+def exploding_master(images, audio, output, **kwargs):
+    raise RuntimeError("master encoder unavailable")
+
+
+def exploding_variant(master, output, **kwargs):
+    raise RuntimeError("variant encoder unavailable")
+
+
+exploding_master.cache_identity = "exploding-master-v1"
+exploding_variant.cache_identity = "exploding-variant-v1"
+
+
+def test_narration_failure_returns_failed_stage_and_redacted_failure(
+    tmp_path: Path, campaign
+):
+    pipeline = CreativePipeline(
+        output_root=tmp_path / "build",
+        image_provider=FakeImages(),
+        narration_provider=ExplodingNarration(),
+        master_renderer=fake_master,
+        variant_renderer=fake_variant,
+    )
+
+    result = pipeline.build(campaign)
+
+    assert result.stages["narration"].status == "failed"
+    assert result.failure["error_category"] == "dependency"
+    assert result.failure["stage"] == "narration"
+    assert "hunter2" not in json.dumps(result.failure)
+    assert "render" not in result.stages
+
+
+def test_master_failure_returns_failed_render_stage(tmp_path: Path, campaign):
+    pipeline = CreativePipeline(
+        output_root=tmp_path / "build",
+        image_provider=FakeImages(),
+        narration_provider=FakeNarration(),
+        master_renderer=exploding_master,
+        variant_renderer=fake_variant,
+    )
+
+    result = pipeline.build(campaign)
+
+    assert result.stages["render"].status == "failed"
+    assert result.failure["error_category"] == "render"
+    assert result.failure["stage"] == "render"
+    assert not any(stage.startswith("variant:") for stage in result.stages)
+
+
+def test_variant_failure_returns_only_prior_and_failed_variant_stages(
+    tmp_path: Path, campaign
+):
+    pipeline = CreativePipeline(
+        output_root=tmp_path / "build",
+        image_provider=FakeImages(),
+        narration_provider=FakeNarration(),
+        master_renderer=fake_master,
+        variant_renderer=exploding_variant,
+    )
+
+    result = pipeline.build(campaign)
+
+    first_variant = f"variant:{campaign.destinations[0]}"
+    assert result.stages[first_variant].status == "failed"
+    assert result.failure["stage"] == first_variant
+    assert campaign.destinations[0] not in result.variant_paths
+    assert len([name for name in result.stages if name.startswith("variant:")]) == 1
+
+
+def test_failed_stage_and_prior_stages_are_persisted_in_manifest(
+    tmp_path: Path, campaign
+):
+    pipeline = CreativePipeline(
+        output_root=tmp_path / "build",
+        image_provider=FakeImages(),
+        narration_provider=FakeNarration(),
+        master_renderer=exploding_master,
+        variant_renderer=fake_variant,
+    )
+
+    result = pipeline.build(campaign)
+    manifest = json.loads(result.manifest_path.read_text())
+
+    assert manifest["stages"]["images"]["status"] == "built"
+    assert manifest["stages"]["narration"]["status"] == "built"
+    assert manifest["stages"]["render"]["status"] == "failed"
+    assert manifest["failure"] == result.failure
+
+
+class CountingImages(FakeImages):
+    def __init__(self):
+        self.calls = 0
+
+    def generate(self, jobs: list[ImageJob]) -> GenerationResult:
+        self.calls += 1
+        return super().generate(jobs)
+
+
+@pytest.mark.parametrize("campaign_id", ["/tmp/absolute", "../escape", "."])
+def test_campaign_build_directory_must_be_strict_descendant(
+    tmp_path: Path, campaign, campaign_id: str
+):
+    images = CountingImages()
+    campaign.campaign_id = campaign_id
+    pipeline = CreativePipeline(
+        output_root=tmp_path / "build",
+        image_provider=images,
+        narration_provider=FakeNarration(),
+        master_renderer=fake_master,
+        variant_renderer=fake_variant,
+    )
+
+    with pytest.raises(ValueError, match="strict descendant"):
+        pipeline.build(campaign)
+    assert images.calls == 0
+
+
+def test_symlinked_campaign_directory_cannot_escape_output_root(
+    tmp_path: Path, campaign
+):
+    output_root = tmp_path / "build"
+    outside = tmp_path / "outside"
+    output_root.mkdir()
+    outside.mkdir()
+    (output_root / "link").symlink_to(outside, target_is_directory=True)
+    images = CountingImages()
+    campaign.campaign_id = "link/campaign"
+    pipeline = CreativePipeline(
+        output_root=output_root,
+        image_provider=images,
+        narration_provider=FakeNarration(),
+        master_renderer=fake_master,
+        variant_renderer=fake_variant,
+    )
+
+    with pytest.raises(ValueError, match="strict descendant"):
+        pipeline.build(campaign)
+    assert images.calls == 0
+    assert not (outside / "campaign").exists()
+
+
+def test_changed_codimage_project_and_job_file_rebuild_images(
+    tmp_path: Path, campaign
+):
+    prefix = [sys.executable, str(FIXTURES / "fake_codimage.py")]
+    first = CreativePipeline(
+        output_root=tmp_path / "build",
+        image_provider=CodimageProvider(
+            project_root=tmp_path / "project-a",
+            executable_prefix=prefix,
+            job_file=tmp_path / "jobs-a.jsonl",
+        ),
+        narration_provider=FakeNarration(),
+        master_renderer=fake_master,
+        variant_renderer=fake_variant,
+    ).build(campaign)
+    second = CreativePipeline(
+        output_root=tmp_path / "build",
+        image_provider=CodimageProvider(
+            project_root=tmp_path / "project-b",
+            executable_prefix=prefix,
+            job_file=tmp_path / "jobs-b.jsonl",
+        ),
+        narration_provider=FakeNarration(),
+        master_renderer=fake_master,
+        variant_renderer=fake_variant,
+    ).build(campaign)
+
+    assert first.stages["images"].status == "built"
+    assert second.stages["images"].status == "built"
+    assert first.stages["images"].command_hash != second.stages["images"].command_hash
+
+
+def _versioned_master(identity: str):
+    def renderer(images, audio, output, **kwargs):
+        return fake_master(images, audio, output, **kwargs)
+
+    renderer.cache_identity = identity
+    return renderer
+
+
+def _versioned_variant(identity: str):
+    def renderer(master, output, **kwargs):
+        return fake_variant(master, output, **kwargs)
+
+    renderer.cache_identity = identity
+    return renderer
+
+
+def test_changed_master_renderer_identity_rebuilds_render(tmp_path: Path, campaign):
+    first = CreativePipeline(
+        tmp_path / "build",
+        FakeImages(),
+        FakeNarration(),
+        master_renderer=_versioned_master("master-v1"),
+        variant_renderer=fake_variant,
+    ).build(campaign)
+    second = CreativePipeline(
+        tmp_path / "build",
+        FakeImages(),
+        FakeNarration(),
+        master_renderer=_versioned_master("master-v2"),
+        variant_renderer=fake_variant,
+    ).build(campaign)
+
+    assert first.stages["render"].status == "built"
+    assert second.stages["render"].status == "built"
+    assert first.stages["render"].command_hash != second.stages["render"].command_hash
+
+
+def test_changed_variant_renderer_identity_rebuilds_variants(tmp_path: Path, campaign):
+    first = CreativePipeline(
+        tmp_path / "build",
+        FakeImages(),
+        FakeNarration(),
+        master_renderer=fake_master,
+        variant_renderer=_versioned_variant("variant-v1"),
+    ).build(campaign)
+    second = CreativePipeline(
+        tmp_path / "build",
+        FakeImages(),
+        FakeNarration(),
+        master_renderer=fake_master,
+        variant_renderer=_versioned_variant("variant-v2"),
+    ).build(campaign)
+
+    assert first.stages["variant:instagram"].status == "built"
+    assert second.stages["variant:instagram"].status == "built"
+    assert (
+        first.stages["variant:instagram"].command_hash
+        != second.stages["variant:instagram"].command_hash
+    )
+
+
+def test_unversioned_custom_renderer_is_never_reused(tmp_path: Path, campaign):
+    def unversioned(images, audio, output, **kwargs):
+        return fake_master(images, audio, output, **kwargs)
+
+    pipeline = CreativePipeline(
+        tmp_path / "build",
+        FakeImages(),
+        FakeNarration(),
+        master_renderer=unversioned,
+        variant_renderer=fake_variant,
+    )
+
+    first = pipeline.build(campaign)
+    second = pipeline.build(campaign)
+
+    assert first.stages["render"].status == "built"
+    assert second.stages["render"].status == "built"
 
 
 @pytest.mark.integration

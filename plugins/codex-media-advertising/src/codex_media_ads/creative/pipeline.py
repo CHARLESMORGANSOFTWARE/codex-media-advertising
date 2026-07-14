@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Literal
@@ -9,6 +10,8 @@ from typing import Callable, Literal
 from ..models import CampaignManifest
 from .providers import ImageJob, ImageProvider, NarrationProvider
 from .render import (
+    MASTER_RENDER_CACHE_VERSION,
+    VARIANT_RENDER_CACHE_VERSION,
     build_master_command,
     build_variant_command,
     render_master,
@@ -26,6 +29,7 @@ class StageResult:
     command_hash: str
     output_hash: str
     path: Path
+    detail: str = ""
 
     def to_json(self) -> dict[str, str]:
         data = asdict(self)
@@ -40,6 +44,7 @@ class BuildResult:
     stages: dict[str, StageResult]
     manifest_path: Path
     dependency: dict[str, object] | None = None
+    failure: dict[str, object] | None = None
 
 
 def _sha_bytes(data: bytes) -> str:
@@ -69,6 +74,46 @@ def _command_identity(provider: object) -> list[str]:
     return [provider.__class__.__module__, provider.__class__.__qualname__]
 
 
+def _renderer_identity(
+    renderer: Callable[..., Path],
+    default_renderer: Callable[..., Path],
+    default_version: str,
+) -> tuple[list[str], bool]:
+    if renderer is default_renderer:
+        return [default_version], True
+    identity = getattr(renderer, "cache_identity", None)
+    if identity is None:
+        identity = getattr(renderer, "version", None)
+    if isinstance(identity, str) and identity:
+        return [identity], True
+    if isinstance(identity, list) and identity and all(
+        isinstance(item, str) and item for item in identity
+    ):
+        return list(identity), True
+    return ["custom-renderer-without-cache-identity"], False
+
+
+_SENSITIVE_ASSIGNMENT = re.compile(
+    r"(?i)\b(token|secret|password|cookie|authorization|api_key)\s*[:=]\s*[^\s,;]+"
+)
+
+
+def _safe_exception_detail(exc: Exception) -> str:
+    message = _SENSITIVE_ASSIGNMENT.sub(
+        lambda match: f"{match.group(1)}=[REDACTED]", str(exc)
+    )
+    return f"{type(exc).__name__}: {message}"[:1000]
+
+
+def _failure(error_category: str, stage: str, detail: str) -> dict[str, object]:
+    return {
+        "error_category": error_category,
+        "stage": stage,
+        "detail": detail,
+        "next_action": f"Resolve the {stage} failure and rerun that stage.",
+    }
+
+
 class CreativePipeline:
     def __init__(
         self,
@@ -90,6 +135,45 @@ class CreativePipeline:
         self.ffprobe = ffprobe
         self.master_renderer = master_renderer
         self.variant_renderer = variant_renderer
+
+    def _build_directory(self, campaign_id: str) -> Path:
+        candidate = (self.output_root / campaign_id).resolve()
+        try:
+            relative = candidate.relative_to(self.output_root)
+        except ValueError as exc:
+            raise ValueError(
+                "campaign build directory must be a strict descendant of output_root"
+            ) from exc
+        if relative == Path("."):
+            raise ValueError(
+                "campaign build directory must be a strict descendant of output_root"
+            )
+        return candidate
+
+    @staticmethod
+    def _write_manifest(
+        manifest_path: Path,
+        campaign_hash: str,
+        input_hashes: dict[str, str],
+        audio_hash: str,
+        stage_records: dict[str, object],
+        *,
+        dependency: dict[str, object] | None = None,
+        failure: dict[str, object] | None = None,
+    ) -> None:
+        manifest: dict[str, object] = {
+            "campaign_hash": campaign_hash,
+            "input_hashes": input_hashes,
+            "audio_hash": audio_hash,
+            "stages": stage_records,
+        }
+        if dependency is not None:
+            manifest["dependency"] = dependency
+        if failure is not None:
+            manifest["failure"] = failure
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        )
 
     @staticmethod
     def _load_manifest(path: Path) -> dict[str, object]:
@@ -129,6 +213,7 @@ class CreativePipeline:
         command_hash: str,
         paths: list[Path],
         path: Path,
+        detail: str = "",
     ) -> tuple[StageResult, dict[str, object]]:
         output_hashes = {
             str(output): _sha_file(output)
@@ -145,6 +230,7 @@ class CreativePipeline:
             command_hash=command_hash,
             output_hash=output_hash,
             path=path,
+            detail=detail,
         )
         record: dict[str, object] = result.to_json()
         record["output_hashes"] = output_hashes
@@ -154,7 +240,7 @@ class CreativePipeline:
         self, campaign: CampaignManifest, force: set[str] | None = None
     ) -> BuildResult:
         force = set(force or ())
-        build_dir = self.output_root / campaign.campaign_id
+        build_dir = self._build_directory(campaign.campaign_id)
         images_dir = build_dir / "images"
         variants_dir = build_dir / "variants"
         manifest_path = build_dir / "build-manifest.json"
@@ -205,15 +291,13 @@ class CreativePipeline:
                 )
                 stages["images"] = stage
                 stage_records["images"] = record
-                manifest = {
-                    "campaign_hash": campaign_hash,
-                    "input_hashes": {},
-                    "audio_hash": "",
-                    "stages": stage_records,
-                    "dependency": generation.dependency,
-                }
-                manifest_path.write_text(
-                    json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+                self._write_manifest(
+                    manifest_path,
+                    campaign_hash,
+                    {},
+                    "",
+                    stage_records,
+                    dependency=generation.dependency,
                 )
                 return BuildResult(
                     master_path=master_path,
@@ -233,6 +317,7 @@ class CreativePipeline:
         )
         stages["images"] = stage
         stage_records["images"] = record
+        input_hashes = {str(path): _sha_file(path) for path in image_paths}
 
         narration_input_hash = _sha_json(
             {"text": campaign.narration, "voice": self.voice}
@@ -251,9 +336,38 @@ class CreativePipeline:
         ):
             narration_status: StageStatus = "reused"
         else:
-            audio_path = self.narration_provider.synthesize(
-                campaign.narration, audio_path, self.voice
-            )
+            try:
+                audio_path = self.narration_provider.synthesize(
+                    campaign.narration, audio_path, self.voice
+                )
+            except Exception as exc:
+                detail = _safe_exception_detail(exc)
+                failure = _failure("dependency", "narration", detail)
+                stage, record = self._stage(
+                    "failed",
+                    narration_input_hash,
+                    narration_command_hash,
+                    [],
+                    audio_path,
+                    detail,
+                )
+                stages["narration"] = stage
+                stage_records["narration"] = record
+                self._write_manifest(
+                    manifest_path,
+                    campaign_hash,
+                    input_hashes,
+                    "",
+                    stage_records,
+                    failure=failure,
+                )
+                return BuildResult(
+                    master_path=master_path,
+                    variant_paths={},
+                    stages=stages,
+                    manifest_path=manifest_path,
+                    failure=failure,
+                )
             narration_status = "built"
         stage, record = self._stage(
             narration_status,
@@ -265,21 +379,28 @@ class CreativePipeline:
         stages["narration"] = stage
         stage_records["narration"] = record
 
-        input_hashes = {str(path): _sha_file(path) for path in image_paths}
         audio_hash = _sha_file(audio_path)
         render_input_hash = _sha_json(
             {"images": input_hashes, "audio": audio_hash}
         )
         concat_path = master_path.with_suffix(".concat.txt")
+        render_identity, render_reusable = _renderer_identity(
+            self.master_renderer,
+            render_master,
+            MASTER_RENDER_CACHE_VERSION,
+        )
         render_command_hash = _sha_json(
-            build_master_command(
-                concat_path, audio_path, master_path, ffmpeg=self.ffmpeg
-            )
+            {
+                "renderer": render_identity,
+                "command": build_master_command(
+                    concat_path, audio_path, master_path, ffmpeg=self.ffmpeg
+                ),
+            }
         )
         previous_render = previous_stages.get("render", {})
         if not isinstance(previous_render, dict):
             previous_render = {}
-        if "render" not in force and self._can_reuse(
+        if render_reusable and "render" not in force and self._can_reuse(
             previous_render,
             render_input_hash,
             render_command_hash,
@@ -287,13 +408,42 @@ class CreativePipeline:
         ):
             render_status: StageStatus = "reused"
         else:
-            master_path = self.master_renderer(
-                image_paths,
-                audio_path,
-                master_path,
-                ffmpeg=self.ffmpeg,
-                ffprobe=self.ffprobe,
-            )
+            try:
+                master_path = self.master_renderer(
+                    image_paths,
+                    audio_path,
+                    master_path,
+                    ffmpeg=self.ffmpeg,
+                    ffprobe=self.ffprobe,
+                )
+            except Exception as exc:
+                detail = _safe_exception_detail(exc)
+                failure = _failure("render", "render", detail)
+                stage, record = self._stage(
+                    "failed",
+                    render_input_hash,
+                    render_command_hash,
+                    [],
+                    master_path,
+                    detail,
+                )
+                stages["render"] = stage
+                stage_records["render"] = record
+                self._write_manifest(
+                    manifest_path,
+                    campaign_hash,
+                    input_hashes,
+                    audio_hash,
+                    stage_records,
+                    failure=failure,
+                )
+                return BuildResult(
+                    master_path=master_path,
+                    variant_paths={},
+                    stages=stages,
+                    manifest_path=manifest_path,
+                    failure=failure,
+                )
             render_status = "built"
         stage, record = self._stage(
             render_status,
@@ -310,20 +460,28 @@ class CreativePipeline:
         for destination in campaign.destinations:
             stage_name = f"variant:{destination}"
             variant_path = (variants_dir / f"{destination}.mp4").resolve()
-            variant_paths[destination] = variant_path
             variant_input_hash = _sha_json(
                 {"master": master_hash, "destination": destination}
             )
+            variant_identity, variant_reusable = _renderer_identity(
+                self.variant_renderer,
+                render_variant,
+                VARIANT_RENDER_CACHE_VERSION,
+            )
             variant_command_hash = _sha_json(
-                build_variant_command(
-                    master_path, variant_path, ffmpeg=self.ffmpeg
-                )
+                {
+                    "renderer": variant_identity,
+                    "command": build_variant_command(
+                        master_path, variant_path, ffmpeg=self.ffmpeg
+                    ),
+                }
             )
             previous_variant = previous_stages.get(stage_name, {})
             if not isinstance(previous_variant, dict):
                 previous_variant = {}
             if (
-                "variants" not in force
+                variant_reusable
+                and "variants" not in force
                 and stage_name not in force
                 and self._can_reuse(
                     previous_variant,
@@ -334,12 +492,41 @@ class CreativePipeline:
             ):
                 variant_status: StageStatus = "reused"
             else:
-                self.variant_renderer(
-                    master_path,
-                    variant_path,
-                    ffmpeg=self.ffmpeg,
-                    ffprobe=self.ffprobe,
-                )
+                try:
+                    self.variant_renderer(
+                        master_path,
+                        variant_path,
+                        ffmpeg=self.ffmpeg,
+                        ffprobe=self.ffprobe,
+                    )
+                except Exception as exc:
+                    detail = _safe_exception_detail(exc)
+                    failure = _failure("render", stage_name, detail)
+                    stage, record = self._stage(
+                        "failed",
+                        variant_input_hash,
+                        variant_command_hash,
+                        [],
+                        variant_path,
+                        detail,
+                    )
+                    stages[stage_name] = stage
+                    stage_records[stage_name] = record
+                    self._write_manifest(
+                        manifest_path,
+                        campaign_hash,
+                        input_hashes,
+                        audio_hash,
+                        stage_records,
+                        failure=failure,
+                    )
+                    return BuildResult(
+                        master_path=master_path,
+                        variant_paths=variant_paths,
+                        stages=stages,
+                        manifest_path=manifest_path,
+                        failure=failure,
+                    )
                 variant_status = "built"
             stage, record = self._stage(
                 variant_status,
@@ -350,15 +537,14 @@ class CreativePipeline:
             )
             stages[stage_name] = stage
             stage_records[stage_name] = record
+            variant_paths[destination] = variant_path
 
-        manifest = {
-            "campaign_hash": campaign_hash,
-            "input_hashes": input_hashes,
-            "audio_hash": audio_hash,
-            "stages": stage_records,
-        }
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        self._write_manifest(
+            manifest_path,
+            campaign_hash,
+            input_hashes,
+            audio_hash,
+            stage_records,
         )
         return BuildResult(
             master_path=master_path,

@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+MASTER_RENDER_CACHE_VERSION = "ffmpeg-master-v1"
+VARIANT_RENDER_CACHE_VERSION = "ffmpeg-variant-v1"
+
+
 @dataclass(frozen=True)
 class MediaProbe:
     video_codec: str
