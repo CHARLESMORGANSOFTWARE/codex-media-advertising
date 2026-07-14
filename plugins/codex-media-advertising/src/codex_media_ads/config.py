@@ -40,7 +40,11 @@ def _is_within(path: Path, parent: Path) -> bool:
     return True
 
 
-def state_layout(root: Path, *, checkout: Path | None = None) -> dict[str, Path]:
+def state_layout(
+    root: Path | None = None, *, checkout: Path | None = None
+) -> dict[str, Path]:
+    if root is None:
+        root = Path.home() / ".codex-media-ads"
     root = Path(root).expanduser().resolve()
     checkout = (
         Path(checkout).expanduser().resolve()
@@ -50,11 +54,11 @@ def state_layout(root: Path, *, checkout: Path | None = None) -> dict[str, Path]
     if checkout is not None and _is_within(root, checkout):
         raise ValueError("private state must be outside the Git checkout")
 
-    root.mkdir(parents=True, exist_ok=True)
+    root.mkdir(mode=PRIVATE_MODES, parents=True, exist_ok=True)
     root.chmod(PRIVATE_MODES)
 
     queue_root = root / "queue"
-    queue_root.mkdir(parents=True, exist_ok=True)
+    queue_root.mkdir(mode=PRIVATE_MODES, parents=True, exist_ok=True)
     queue_root.chmod(PRIVATE_MODES)
 
     relative_paths = (
@@ -73,6 +77,6 @@ def state_layout(root: Path, *, checkout: Path | None = None) -> dict[str, Path]
     )
     layout = {relative: root / relative for relative in relative_paths}
     for path in layout.values():
-        path.mkdir(parents=True, exist_ok=True)
+        path.mkdir(mode=PRIVATE_MODES, parents=True, exist_ok=True)
         path.chmod(PRIVATE_MODES)
     return layout

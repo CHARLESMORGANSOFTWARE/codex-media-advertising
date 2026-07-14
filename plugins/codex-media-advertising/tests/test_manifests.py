@@ -41,6 +41,48 @@ def test_state_layout_never_uses_checkout(tmp_path: Path):
         state_layout(checkout / "runtime", checkout=checkout)
 
 
+def test_state_layout_defaults_to_private_directory_under_runtime_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    layout = state_layout()
+
+    expected_root = (home / ".codex-media-ads").resolve()
+    assert layout["config"] == expected_root / "config"
+    assert stat.S_IMODE(expected_root.stat().st_mode) == PRIVATE_MODES
+
+
+def test_state_layout_creates_directories_with_private_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    checkout = tmp_path / "repo"
+    checkout.mkdir()
+    root = tmp_path / "private-state"
+    mkdir_calls: list[tuple[Path, int]] = []
+    original_mkdir = Path.mkdir
+
+    def record_mkdir(
+        path: Path,
+        mode: int = 0o777,
+        parents: bool = False,
+        exist_ok: bool = False,
+    ) -> None:
+        if path == root or root in path.parents:
+            mkdir_calls.append((path, mode))
+        original_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(Path, "mkdir", record_mkdir)
+
+    state_layout(root, checkout=checkout)
+
+    first_mode_by_path = {path: mode for path, mode in reversed(mkdir_calls)}
+    assert first_mode_by_path
+    assert set(first_mode_by_path.values()) == {PRIVATE_MODES}
+
+
 def test_valid_manifest_has_stable_content_id(example_campaign: Path):
     first = load_campaign(example_campaign)
     second = load_campaign(example_campaign)
