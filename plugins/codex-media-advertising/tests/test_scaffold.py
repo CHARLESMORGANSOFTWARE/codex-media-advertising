@@ -42,7 +42,7 @@ def test_manifest_describes_public_plugin_capabilities():
     assert interface["displayName"] == "Codex Media & Advertising"
     assert interface["category"] == "Productivity"
     assert interface["capabilities"] == ["Interactive", "Write", "Automation"]
-    assert "websiteURL" not in interface
+    assert interface["websiteURL"] == "https://github.com/CHARLESMORGANSOFTWARE/codex-media-advertising"
     assert "privacyPolicyURL" not in interface
 
 

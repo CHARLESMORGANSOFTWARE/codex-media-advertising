@@ -3,20 +3,25 @@
   "version": "0.1.0",
   "description": "Local media creation and social publishing automation for Codex",
   "author": {
-    "name": "Local developer"
+    "name": "CHARLESMORGANSOFTWARE",
+    "url": "https://github.com/CHARLESMORGANSOFTWARE"
   },
+  "homepage": "https://github.com/CHARLESMORGANSOFTWARE/codex-media-advertising#readme",
+  "repository": "https://github.com/CHARLESMORGANSOFTWARE/codex-media-advertising",
+  "license": "Apache-2.0",
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex Media & Advertising",
     "shortDescription": "Create media and automate social publishing.",
     "longDescription": "Create campaign media and run local, receipt-backed social publishing automations from Codex.",
-    "developerName": "Local developer",
+    "developerName": "CHARLESMORGANSOFTWARE",
     "category": "Productivity",
     "capabilities": [
       "Interactive",
       "Write",
       "Automation"
     ],
+    "websiteURL": "https://github.com/CHARLESMORGANSOFTWARE/codex-media-advertising",
     "defaultPrompt": "Help me create and publish a media campaign."
   }
 }
