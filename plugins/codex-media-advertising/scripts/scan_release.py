@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import stat
 import subprocess
 import sys
 import zipfile
@@ -29,10 +30,24 @@ _SECRET_ASSIGN_RE = re.compile(
     r"\b(?:access[_-]?token|client[_-]?secret|refresh[_-]?token|api[_-]?key)\b\s*[:=]\s*[\"'][^\"']{12,}[\"']",
     re.IGNORECASE,
 )
-_PRIVATE_NAME_RE = re.compile(
-    r"(?:^|/)(?:\.env(?:\..*)?|.*(?:cookies?|browser[-_ ]?profiles?|tokens?|private[-_ ]?keys?|receipts\.jsonl|queue/|logs?/|generated/).*)$",
+_PRIVATE_DIRECTORY_NAMES = {
+    "browser-profile",
+    "browser-profiles",
+    "browser_profile",
+    "browser_profiles",
+    "generated",
+    "log",
+    "logs",
+    "queue",
+    "queues",
+    "receipt",
+    "receipts",
+}
+_PRIVATE_FILENAME_RE = re.compile(
+    r"(?:cookies?|browser[-_ ]?profiles?|tokens?|private[-_ ]?keys?|receipts?|queues?|logs?|generated)",
     re.IGNORECASE,
 )
+_PRIVATE_DATA_SUFFIXES = {".json", ".jsonl", ".log", ".db", ".sqlite", ".sqlite3"}
 _MEDIA_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm", ".wav", ".mp3", ".png", ".jpg", ".jpeg"}
 _ALLOWED_MEDIA = {
     "plugins/codex-media-advertising/tests/fixtures/synthetic.png",
@@ -44,6 +59,19 @@ _ALLOWED_ABSOLUTE_FILES = {
 }
 _ALLOWED_SCANNER_FILES = {
     "plugins/codex-media-advertising/scripts/scan_release.py",
+}
+_ALLOWED_SYNTHETIC_FIXTURES = {
+    "plugins/codex-media-advertising/tests/fixtures/fake_codimage.py",
+    "plugins/codex-media-advertising/tests/fixtures/fake_tts.py",
+}
+# These tests intentionally embed fake credential-shaped values and canonical
+# Chrome paths to exercise redaction/process parsing. They are narrow, named
+# allowlists; all other test files are scanned normally.
+_ALLOWED_SYNTHETIC_TESTS = {
+    "plugins/codex-media-advertising/tests/test_api_adapters.py",
+    "plugins/codex-media-advertising/tests/test_chrome_runtime.py",
+    "plugins/codex-media-advertising/tests/test_publishing_base.py",
+    "plugins/codex-media-advertising/tests/test_release_tools.py",
 }
 _ALLOWED_EMAIL_DOMAINS = {"example.com", "example.test", "example.org"}
 _ALLOWED_IDENTIFIERS = {"CHARLESMORGANSOFTWARE/codex-media-advertising"}
@@ -114,15 +142,27 @@ def _scan_text(relative: str, text: str) -> list[str]:
 def _scan_member(relative: str, data: bytes) -> list[str]:
     findings: list[str] = []
     normalized = _posix(relative)
-    if _PRIVATE_NAME_RE.search(normalized) and not normalized.endswith("/receipts.py"):
+    parts = PurePosixPath(normalized).parts
+    parent_parts = {part.casefold() for part in parts[:-1]}
+    filename = parts[-1] if parts else normalized
+    filename_lower = filename.casefold()
+    private_path = bool(parent_parts & _PRIVATE_DIRECTORY_NAMES)
+    if filename_lower.startswith(".env"):
+        private_path = True
+    elif (
+        PurePosixPath(filename_lower).suffix in _PRIVATE_DATA_SUFFIXES
+        and _PRIVATE_FILENAME_RE.search(filename)
+    ):
+        private_path = True
+    if private_path and not normalized.endswith("/receipts.py"):
         findings.append(f"{normalized}: private artifact filename")
     suffix = PurePosixPath(normalized).suffix.lower()
     if suffix in _MEDIA_SUFFIXES and normalized not in _ALLOWED_MEDIA:
         findings.append(f"{normalized}: generated media is not allowlisted")
-    # Tests intentionally contain synthetic identities, fixture paths, and
-    # placeholder secret-key names to exercise the safety gates. They are an
-    # explicit documented allowlist; production source and docs are scanned.
-    if "/tests/" in f"/{normalized}" or normalized.startswith("tests/"):
+    # Provider stand-ins and focused safety tests intentionally contain fake
+    # credentials or canonical paths. These named files are the only test
+    # allowlist; every other test is scanned like production code.
+    if normalized in _ALLOWED_SYNTHETIC_FIXTURES or normalized in _ALLOWED_SYNTHETIC_TESTS:
         return findings
     if normalized in _ALLOWED_SCANNER_FILES:
         return findings
@@ -139,6 +179,10 @@ def scan_archive(path: Path) -> list[str]:
     with zipfile.ZipFile(path) as archive:
         for member in sorted(archive.namelist()):
             if member.endswith("/") or _excluded(member):
+                continue
+            info = archive.getinfo(member)
+            if stat.S_ISLNK(info.external_attr >> 16):
+                findings.append(f"{member}: archive symlink is not allowed in a release")
                 continue
             findings.extend(_scan_member(member, archive.read(member)))
     return findings
@@ -158,6 +202,9 @@ def scan_path(path: Path | str) -> list[str]:
             continue
         file_path = root / relative
         try:
+            if file_path.is_symlink():
+                findings.append(f"{rel}: tracked symlink is not allowed in a release")
+                continue
             findings.extend(_scan_member(rel, file_path.read_bytes()))
         except OSError as exc:
             findings.append(f"{rel}: unreadable file ({exc.__class__.__name__})")

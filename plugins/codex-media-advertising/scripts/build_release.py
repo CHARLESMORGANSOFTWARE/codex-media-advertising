@@ -66,6 +66,12 @@ def build_release(root: Path | str, dist: Path | str | None = None) -> tuple[Pat
     if checkout_findings:
         raise RuntimeError("checkout failed release scan:\n" + "\n".join(checkout_findings))
     files = archive_files(tracked_files(root))
+    for relative in files:
+        source = root / relative
+        if source.is_symlink():
+            raise RuntimeError(f"tracked symlink cannot be included in release: {relative}")
+        if not source.is_file():
+            raise RuntimeError(f"tracked release path is not a regular file: {relative}")
     dist.mkdir(parents=True, exist_ok=True)
     archive = dist / ARCHIVE_NAME
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as handle:
