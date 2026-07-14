@@ -44,7 +44,7 @@ class _AmbiguousSubmit(RuntimeError):
 
 
 def _is_connection_loss(exc: BaseException) -> bool:
-    return isinstance(
+    if isinstance(
         exc,
         (
             TimeoutError,
@@ -52,6 +52,31 @@ def _is_connection_loss(exc: BaseException) -> bool:
             requests.exceptions.Timeout,
             requests.exceptions.ConnectionError,
         ),
+    ):
+        return True
+    phase = str(getattr(exc, "phase", "")).strip().casefold().replace("-", "_")
+    if phase in {"response", "response_body", "response_stream", "body_read"}:
+        return True
+    # Transport implementations do not need to depend on requests merely to
+    # communicate that the request was sent and the response body was lost.
+    name = exc.__class__.__name__.casefold()
+    return any(
+        marker in name
+        for marker in ("chunkedencoding", "incompleteread", "responsebodylost")
+    )
+
+
+def _is_response_phase_loss(exc: BaseException) -> bool:
+    phase = str(getattr(exc, "phase", "")).strip().casefold().replace("-", "_")
+    name = exc.__class__.__name__.casefold()
+    return phase in {
+        "response",
+        "response_body",
+        "response_stream",
+        "body_read",
+    } or any(
+        marker in name
+        for marker in ("chunkedencoding", "incompleteread", "responsebodylost")
     )
 
 
@@ -106,7 +131,12 @@ def _read_secret(account: AccountConfig) -> dict[str, object]:
     return value
 
 
-def _response_json(response: object, operation: str) -> dict[str, object]:
+def _response_json(
+    response: object,
+    operation: str,
+    *,
+    ambiguous_success: bool = False,
+) -> dict[str, object]:
     status_code = int(getattr(response, "status_code", 0) or 0)
     if not 200 <= status_code < 300:
         # Response bodies are useful during development, but must pass through the
@@ -125,14 +155,26 @@ def _response_json(response: object, operation: str) -> dict[str, object]:
             category=category,
         )
     if status_code == 204:
+        if ambiguous_success:
+            raise _AmbiguousSubmit(
+                f"{operation} returned success without publication evidence; reconcile before retrying"
+            )
         return {}
     try:
         value = response.json()  # type: ignore[attr-defined]
     except Exception as exc:
+        if ambiguous_success:
+            raise _AmbiguousSubmit(
+                f"{operation} returned success but its response body was unreadable; reconcile before retrying"
+            ) from exc
         if not str(getattr(response, "text", "")):
             return {}
         raise _ApiFailure(f"{operation} returned invalid JSON") from exc
     if not isinstance(value, dict):
+        if ambiguous_success:
+            raise _AmbiguousSubmit(
+                f"{operation} returned success with malformed publication evidence; reconcile before retrying"
+            )
         raise _ApiFailure(f"{operation} returned an invalid response object")
     return value
 
@@ -209,7 +251,14 @@ def _final_request_json(
                 f"{operation} may have reached the platform; reconcile before retrying: {exc}"
             ) from exc
         raise _ApiFailure(f"{operation} request failed: {exc}") from exc
-    return _response_json(response, operation)
+    try:
+        return _response_json(response, operation, ambiguous_success=True)
+    except (_ApiFailure, _AmbiguousSubmit):
+        raise
+    except Exception as exc:
+        raise _AmbiguousSubmit(
+            f"{operation} response could not be read; reconcile before retrying"
+        ) from exc
 
 
 def _oauth_encode(value: object) -> str:
@@ -615,8 +664,10 @@ class YouTubePublisher(_PublisherBase):
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         super().__init__(transport)
-        if chunk_size < 1:
-            raise ValueError("chunk_size must be positive")
+        if chunk_size < 1 or chunk_size % (256 * 1024):
+            raise ValueError(
+                "chunk_size must be a positive multiple of 256 KiB; only the final chunk may be smaller"
+            )
         if max_resume_attempts < 1:
             raise ValueError("max_resume_attempts must be positive")
         self.chunk_size = chunk_size
@@ -794,12 +845,23 @@ class YouTubePublisher(_PublisherBase):
                     ) from exc
                 last_error = exc
                 continue
-            status_code = int(getattr(response, "status_code", 0) or 0)
+            try:
+                status_code = int(getattr(response, "status_code", 0) or 0)
+            except Exception as exc:
+                if final_chunk_was_sent:
+                    raise _AmbiguousSubmit(
+                        "YouTube final upload status response could not be read; reconcile before retrying"
+                    ) from exc
+                raise _ApiFailure(
+                    "YouTube upload status response could not be read"
+                ) from exc
             if status_code == 308:
                 return self._resume_offset(response, media_size), None
             if 200 <= status_code < 300:
                 return media_size, _response_json(
-                    response, "YouTube upload status reconciliation"
+                    response,
+                    "YouTube upload status reconciliation",
+                    ambiguous_success=True,
                 )
             if status_code in {500, 502, 503, 504}:
                 last_error = _ApiFailure(
@@ -851,7 +913,11 @@ class YouTubePublisher(_PublisherBase):
                 except Exception as exc:
                     if not _is_connection_loss(exc):
                         raise _ApiFailure(f"YouTube media upload failed: {exc}") from exc
-                    offset, completed = self._query_upload_status(
+                    if final_chunk and _is_response_phase_loss(exc):
+                        raise _AmbiguousSubmit(
+                            "YouTube final upload response stream was lost; reconcile before retrying"
+                        ) from exc
+                    next_offset, completed = self._query_upload_status(
                         location=location,
                         media_size=media_size,
                         access_token=access_token,
@@ -859,9 +925,27 @@ class YouTubePublisher(_PublisherBase):
                     )
                     if completed is not None:
                         return completed
+                    if next_offset <= offset:
+                        stalled_responses += 1
+                        if stalled_responses >= self.max_resume_attempts:
+                            raise _ApiFailure(
+                                "YouTube resumable reconciliation made no progress before the retry limit"
+                            )
+                    else:
+                        stalled_responses = 0
+                    offset = next_offset
                     continue
 
-                status_code = int(getattr(response, "status_code", 0) or 0)
+                try:
+                    status_code = int(getattr(response, "status_code", 0) or 0)
+                except Exception as exc:
+                    if final_chunk:
+                        raise _AmbiguousSubmit(
+                            "YouTube final upload response could not be read; reconcile before retrying"
+                        ) from exc
+                    raise _ApiFailure(
+                        "YouTube upload response could not be read"
+                    ) from exc
                 if status_code == 308:
                     next_offset = self._resume_offset(response, media_size)
                     if next_offset <= offset:
@@ -875,7 +959,7 @@ class YouTubePublisher(_PublisherBase):
                     offset = next_offset
                     continue
                 if status_code in {500, 502, 503, 504}:
-                    offset, completed = self._query_upload_status(
+                    next_offset, completed = self._query_upload_status(
                         location=location,
                         media_size=media_size,
                         access_token=access_token,
@@ -883,9 +967,22 @@ class YouTubePublisher(_PublisherBase):
                     )
                     if completed is not None:
                         return completed
+                    if next_offset <= offset:
+                        stalled_responses += 1
+                        if stalled_responses >= self.max_resume_attempts:
+                            raise _ApiFailure(
+                                "YouTube resumable reconciliation made no progress before the retry limit"
+                            )
+                    else:
+                        stalled_responses = 0
+                    offset = next_offset
                     continue
                 if 200 <= status_code < 300:
-                    return _response_json(response, "YouTube media upload")
+                    return _response_json(
+                        response,
+                        "YouTube media upload",
+                        ambiguous_success=True,
+                    )
                 _response_json(response, "YouTube media upload")
         raise _ApiFailure("YouTube upload ended without a completion response")
 

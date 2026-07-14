@@ -31,6 +31,15 @@ class EmptyResponse(FakeResponse):
         raise ValueError("no response body")
 
 
+class TruncatedSuccessResponse(FakeResponse):
+    def json(self) -> object:
+        raise ValueError("truncated JSON response body")
+
+
+class ResponseStreamLostError(Exception):
+    phase = "response_body"
+
+
 class QueueTransport:
     def __init__(self, responses: list[FakeResponse | BaseException]) -> None:
         self.responses = list(responses)
@@ -220,6 +229,37 @@ def test_meta_final_publish_timeout_is_ambiguous_unknown(tmp_path: Path) -> None
     assert "must-not-leak" not in result.model_dump_json()
 
 
+@pytest.mark.parametrize(
+    "final_response",
+    [
+        TruncatedSuccessResponse(status_code=200, text="{"),
+        ResponseStreamLostError("response stream ended early"),
+    ],
+)
+def test_meta_success_or_response_stream_loss_at_final_publish_is_unknown(
+    tmp_path: Path, final_response: FakeResponse | BaseException
+) -> None:
+    from codex_media_ads.publishing.api_adapters import MetaPublisher
+
+    transport = QueueTransport(
+        [
+            FakeResponse({"id": "ig-destination-1", "username": "expected-account"}),
+            FakeResponse({"id": "creation-1"}),
+            FakeResponse({"success": True}),
+            FakeResponse({"status_code": "FINISHED"}),
+            final_response,
+        ]
+    )
+
+    result = MetaPublisher("instagram", transport, sleep=lambda _seconds: None).publish(
+        _request(tmp_path, platform="instagram")
+    )
+
+    assert result.status == "unknown"
+    assert result.error_category == "ambiguous_submit"
+    assert result.evidence["retry_safe"] is False
+
+
 def test_youtube_reports_requested_and_actual_upload_evidence(tmp_path: Path) -> None:
     from codex_media_ads.publishing.api_adapters import YouTubePublisher
 
@@ -340,6 +380,105 @@ def test_youtube_final_chunk_timeout_without_reconciliation_is_unknown(
     assert result.error_category == "ambiguous_submit"
     assert result.evidence["retry_safe"] is False
     assert len([call for call in transport.calls if call[0] == "PUT"]) == 2
+
+
+def test_youtube_repeated_zero_progress_reconciliation_is_bounded(
+    tmp_path: Path,
+) -> None:
+    from codex_media_ads.publishing.api_adapters import YouTubePublisher
+
+    transport = QueueTransport(
+        [
+            FakeResponse({"items": [{"snippet": {"title": "expected-account"}}]}),
+            EmptyResponse(headers={"Location": "https://upload.example/session-1"}),
+            TimeoutError("upload response lost"),
+            EmptyResponse(status_code=308),
+            TimeoutError("upload response lost again"),
+            EmptyResponse(status_code=308),
+        ]
+    )
+
+    result = YouTubePublisher(
+        transport,
+        max_resume_attempts=2,
+        sleep=lambda _seconds: None,
+    ).publish(_request(tmp_path, platform="youtube", metadata={"title": "title"}))
+
+    assert result.status == "failed"
+    assert result.evidence["retry_safe"] is False
+    assert len([call for call in transport.calls if call[0] == "PUT"]) == 4
+    assert transport.responses == []
+
+
+def test_youtube_repeated_5xx_zero_progress_reconciliation_is_bounded(
+    tmp_path: Path,
+) -> None:
+    from codex_media_ads.publishing.api_adapters import YouTubePublisher
+
+    transport = QueueTransport(
+        [
+            FakeResponse({"items": [{"snippet": {"title": "expected-account"}}]}),
+            EmptyResponse(headers={"Location": "https://upload.example/session-1"}),
+            FakeResponse(status_code=503, text="unavailable"),
+            EmptyResponse(status_code=308),
+            FakeResponse(status_code=503, text="unavailable"),
+            EmptyResponse(status_code=308),
+        ]
+    )
+
+    result = YouTubePublisher(
+        transport,
+        max_resume_attempts=2,
+        sleep=lambda _seconds: None,
+    ).publish(_request(tmp_path, platform="youtube", metadata={"title": "title"}))
+
+    assert result.status == "failed"
+    assert result.evidence["retry_safe"] is False
+    assert len([call for call in transport.calls if call[0] == "PUT"]) == 4
+    assert transport.responses == []
+
+
+@pytest.mark.parametrize(
+    "final_response",
+    [
+        TruncatedSuccessResponse(status_code=201, text="{"),
+        ResponseStreamLostError("response stream ended early"),
+    ],
+)
+def test_youtube_final_response_body_loss_is_ambiguous_unknown(
+    tmp_path: Path, final_response: FakeResponse | BaseException
+) -> None:
+    from codex_media_ads.publishing.api_adapters import YouTubePublisher
+
+    transport = QueueTransport(
+        [
+            FakeResponse({"items": [{"snippet": {"title": "expected-account"}}]}),
+            EmptyResponse(headers={"Location": "https://upload.example/session-1"}),
+            final_response,
+        ]
+    )
+
+    result = YouTubePublisher(transport, max_resume_attempts=1).publish(
+        _request(tmp_path, platform="youtube", metadata={"title": "title"})
+    )
+
+    assert result.status == "unknown"
+    assert result.error_category == "ambiguous_submit"
+    assert result.evidence["retry_safe"] is False
+
+
+@pytest.mark.parametrize("chunk_size", [0, 1, 256 * 1024 + 1])
+def test_youtube_rejects_invalid_nonfinal_chunk_size(chunk_size: int) -> None:
+    from codex_media_ads.publishing.api_adapters import YouTubePublisher
+
+    with pytest.raises(ValueError, match="256 KiB"):
+        YouTubePublisher(QueueTransport([]), chunk_size=chunk_size)
+
+
+def test_youtube_accepts_256_kib_chunk_size() -> None:
+    from codex_media_ads.publishing.api_adapters import YouTubePublisher
+
+    assert YouTubePublisher(QueueTransport([]), chunk_size=256 * 1024).chunk_size == 256 * 1024
 
 
 def test_x_uploads_chunks_polls_and_creates_post_with_disclosures(
@@ -482,6 +621,37 @@ def test_x_tweet_timeout_is_ambiguous_unknown(tmp_path: Path) -> None:
     assert result.error_category == "ambiguous_submit"
     assert result.evidence["retry_safe"] is False
     assert "must-not-leak" not in result.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    "final_response",
+    [
+        TruncatedSuccessResponse(status_code=201, text="{"),
+        ResponseStreamLostError("response stream ended early"),
+    ],
+)
+def test_x_final_response_body_loss_is_ambiguous_unknown(
+    tmp_path: Path, final_response: FakeResponse | BaseException
+) -> None:
+    from codex_media_ads.publishing.api_adapters import XPublisher
+
+    transport = QueueTransport(
+        [
+            FakeResponse({"screen_name": "expected-account"}),
+            FakeResponse({"media_id_string": "media-1"}),
+            EmptyResponse(status_code=204),
+            FakeResponse({"media_id_string": "media-1"}),
+            final_response,
+        ]
+    )
+
+    result = XPublisher(transport, chunk_size=20).publish(
+        _request(tmp_path, platform="x")
+    )
+
+    assert result.status == "unknown"
+    assert result.error_category == "ambiguous_submit"
+    assert result.evidence["retry_safe"] is False
 
 
 @pytest.mark.parametrize("publisher_name", ["youtube", "x"])
