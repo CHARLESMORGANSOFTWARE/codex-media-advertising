@@ -10,7 +10,7 @@ installation. API and browser extras are optional per destination.
 git clone https://github.com/CHARLESMORGANSOFTWARE/codex-media-advertising.git
 cd codex-media-advertising
 codex plugin marketplace add "$PWD"
-codex plugin add codex-media-advertising@codex-media-advertising
+codex plugin add codex-media-advertising@personal
 ./plugins/codex-media-advertising/scripts/install.sh
 ```
 

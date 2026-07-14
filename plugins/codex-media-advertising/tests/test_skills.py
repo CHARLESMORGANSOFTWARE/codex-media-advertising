@@ -101,6 +101,6 @@ def test_installation_docs_use_public_marketplace_commands_and_accurate_extras()
 
     assert "https://github.com/CHARLESMORGANSOFTWARE/codex-media-advertising.git" in text
     assert 'codex plugin marketplace add "$PWD"' in text
-    assert "codex plugin add codex-media-advertising@codex-media-advertising" in text
+    assert "codex plugin add codex-media-advertising@personal" in text
     assert "does not install the optional `browser` or `youtube` Python extras" in text
     assert "optional local dependencies available on the machine" not in text
