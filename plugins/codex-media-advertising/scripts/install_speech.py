@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import sysconfig
@@ -87,6 +88,15 @@ def validate_managed_paths(install_root: Path) -> None:
             )
 
 
+def _ensure_private_install_root(install_root: Path) -> None:
+    install_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not install_root.is_dir():
+        raise SpeechInstallError("unsafe install root: path is not a directory")
+    install_root.chmod(0o700)
+    if stat.S_IMODE(install_root.stat().st_mode) != 0o700:
+        raise SpeechInstallError("unsafe install root: mode must be 0700")
+
+
 def build_plan(
     lock: dict[str, Any], install_root: Path
 ) -> list[tuple[list[str], Path | None]]:
@@ -94,6 +104,7 @@ def build_plan(
     source = source_parent / "speaches"
     revision = lock["git_revision"]
     plan: list[tuple[list[str], Path | None]] = [
+        (["mkdir", "-m", "0700", "-p", str(install_root)], None),
         (["mkdir", "-p", str(source_parent)], None),
         (
             [
@@ -107,8 +118,15 @@ def build_plan(
         ),
     ]
     if source.exists():
-        plan.append(
-            (["git", "fetch", "--force", "origin", revision], source)
+        plan.extend(
+            [
+                (
+                    ["git", "remote", "set-url", "origin", lock["git_url"]],
+                    source,
+                ),
+                (["git", "remote", "get-url", "origin"], source),
+                (["git", "fetch", "--force", "origin", revision], source),
+            ]
         )
     else:
         plan.append(
@@ -127,6 +145,7 @@ def build_plan(
         [
             (["git", "checkout", "--detach", revision], source),
             (["git", "rev-parse", "HEAD"], source),
+            (["git", "status", "--porcelain", "--untracked-files=no"], source),
             ([_uv_executable(), "python", "install", lock["python_version"]], None),
             ([_uv_executable(), "sync", "--frozen"], source),
         ]
@@ -142,21 +161,40 @@ def print_plan(plan: list[tuple[list[str], Path | None]]) -> None:
 
 
 def execute_plan(
-    plan: list[tuple[list[str], Path | None]], revision: str
+    plan: list[tuple[list[str], Path | None]], revision: str, git_url: str
 ) -> None:
     for command, cwd in plan:
+        if command[:4] == ["mkdir", "-m", "0700", "-p"]:
+            _ensure_private_install_root(Path(command[4]))
+            continue
         if command[:2] == ["mkdir", "-p"]:
             Path(command[2]).mkdir(parents=True, exist_ok=True)
             continue
         kwargs: dict[str, object] = {"check": True}
         if cwd is not None:
             kwargs["cwd"] = cwd
+        if command == ["git", "remote", "get-url", "origin"]:
+            kwargs.update({"capture_output": True, "text": True})
+            completed = subprocess.run(command, **kwargs)
+            if completed.stdout.strip() != git_url:
+                raise SpeechInstallError(
+                    "managed Speaches origin does not match locked git_url"
+                )
+            continue
         if command == ["git", "rev-parse", "HEAD"]:
             kwargs.update({"capture_output": True, "text": True})
             completed = subprocess.run(command, **kwargs)
             if completed.stdout.strip() != revision:
                 raise SpeechInstallError(
                     "checked out HEAD does not match pinned revision"
+                )
+            continue
+        if command == ["git", "status", "--porcelain", "--untracked-files=no"]:
+            kwargs.update({"capture_output": True, "text": True})
+            completed = subprocess.run(command, **kwargs)
+            if completed.stdout.strip():
+                raise SpeechInstallError(
+                    "managed Speaches checkout has tracked changes; refusing to sync"
                 )
             continue
         subprocess.run(command, **kwargs)
@@ -182,7 +220,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.dry_run:
             print_plan(plan)
             return 0
-        execute_plan(plan, lock["git_revision"])
+        execute_plan(plan, lock["git_revision"], lock["git_url"])
         return 0
     except subprocess.CalledProcessError as exc:
         print(
