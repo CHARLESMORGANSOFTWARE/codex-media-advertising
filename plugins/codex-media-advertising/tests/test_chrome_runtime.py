@@ -28,10 +28,18 @@ def test_process_table_captures_group_session_state_and_stable_start(monkeypatch
         "  101  1  101  101  S  Tue Jul 14 12:34:56 2026 "
         "/Applications/Google Chrome --user-data-dir=/private/run\n"
     )
+    captured = {}
+
+    def run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(stdout=output, stderr="", returncode=0)
+
+    monkeypatch.setattr(chrome_module.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(
         chrome_module.subprocess,
         "run",
-        lambda *_args, **_kwargs: SimpleNamespace(stdout=output),
+        run,
     )
     assert chrome_module._system_process_table() == [
         ProcessRecord(
@@ -44,6 +52,42 @@ def test_process_table_captures_group_session_state_and_stable_start(monkeypatch
             "Tue Jul 14 12:34:56 2026",
         )
     ]
+    assert captured["argv"] == [
+        "ps",
+        "-axo",
+        "pid=,ppid=,pgid=,sess=,state=,lstart=,command=",
+    ]
+    assert captured["kwargs"]["shell"] is False
+
+
+def test_process_table_uses_linux_sid_keyword(monkeypatch) -> None:
+    captured = {}
+
+    def run(argv, **_kwargs):
+        captured["argv"] = argv
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(chrome_module.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(chrome_module.subprocess, "run", run)
+    assert chrome_module._system_process_table() == []
+    assert captured["argv"][-1] == "pid=,ppid=,pgid=,sid=,state=,lstart=,command="
+
+
+def test_process_table_nonzero_is_explicit_and_redacted(monkeypatch) -> None:
+    monkeypatch.setattr(chrome_module.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        chrome_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            stdout="",
+            stderr="Cookie: sid=ps-secret; csrf=other-secret",
+            returncode=1,
+        ),
+    )
+    with pytest.raises(RuntimeError, match="process discovery failed") as captured:
+        chrome_module._system_process_table()
+    assert "ps-secret" not in str(captured.value)
+    assert "other-secret" not in str(captured.value)
 
 
 def make_source(root: Path) -> Path:

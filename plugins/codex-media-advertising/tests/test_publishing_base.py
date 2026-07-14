@@ -130,6 +130,8 @@ def test_adapter_exceptions_are_stable_and_redacted(exception: Exception, expect
         "Cookie: sid=cookie-secret; csrf=csrf-secret; theme=dark",
         "Set-Cookie: sid=set-cookie-secret; Path=/; HttpOnly",
         '{"cookies":[{"name":"sid","value":"jar-secret"}],"safe":true}',
+        '[{"name":"sid","value":"top-level-jar-secret","domain":".example.com"}]',
+        '{"name":"sessionid","value":"object-cookie-secret","path":"/"}',
     ],
 )
 def test_adapter_redaction_covers_headers_json_and_oauth_tokens(detail: str) -> None:
@@ -144,3 +146,12 @@ def test_adapter_redaction_covers_headers_json_and_oauth_tokens(detail: str) -> 
     assert "csrf-secret" not in result.detail
     assert "set-cookie-secret" not in result.detail
     assert "jar-secret" not in result.detail
+    assert "top-level-jar-secret" not in result.detail
+    assert "object-cookie-secret" not in result.detail
+
+
+def test_redaction_preserves_generic_name_value_json_objects() -> None:
+    result = normalize_adapter_error(
+        RuntimeError('{"name":"campaign_color","value":"ocean-blue"}')
+    )
+    assert "ocean-blue" in result.detail

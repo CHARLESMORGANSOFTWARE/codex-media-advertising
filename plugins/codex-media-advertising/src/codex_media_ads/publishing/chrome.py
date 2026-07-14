@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import platform
 import re
 import shutil
 import signal
@@ -102,17 +103,26 @@ class ProcessRecord:
 
 
 def _system_process_table() -> list[ProcessRecord]:
+    bsd_systems = {"Darwin", "FreeBSD", "OpenBSD", "NetBSD"}
+    session_keyword = "sess" if platform.system() in bsd_systems else "sid"
     completed = subprocess.run(
         [
             "ps",
             "-axo",
-            "pid=,ppid=,pgid=,sid=,state=,lstart=,command=",
+            f"pid=,ppid=,pgid=,{session_keyword}=,state=,lstart=,command=",
         ],
         check=False,
         capture_output=True,
         text=True,
         shell=False,
     )
+    if completed.returncode != 0:
+        diagnostic = redact_diagnostic(completed.stderr.strip())
+        if not diagnostic:
+            diagnostic = "no ps diagnostic was returned"
+        raise RuntimeError(
+            f"process discovery failed (ps exit {completed.returncode}): {diagnostic}"
+        )
     records: list[ProcessRecord] = []
     for line in completed.stdout.splitlines():
         parts = line.strip().split(maxsplit=10)

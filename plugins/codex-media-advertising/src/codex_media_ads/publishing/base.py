@@ -232,10 +232,11 @@ def redact_diagnostic(value: str) -> str:
 
 def _redact_json_value(value: object) -> object:
     if isinstance(value, dict):
+        cookie_record = _looks_like_cookie_record(value)
         output: dict[str, object] = {}
         for key, item in value.items():
             normalized = str(key).casefold().replace("-", "_")
-            if any(
+            if (cookie_record and normalized in {"value", "encrypted_value"}) or any(
                 part in normalized
                 for part in (
                     "cookie",
@@ -254,6 +255,38 @@ def _redact_json_value(value: object) -> object:
     if isinstance(value, list):
         return [_redact_json_value(item) for item in value]
     return value
+
+
+def _looks_like_cookie_record(value: dict[object, object]) -> bool:
+    normalized = {
+        str(key).casefold().replace("-", "_"): item for key, item in value.items()
+    }
+    if "name" not in normalized or "value" not in normalized:
+        return False
+    cookie_attributes = {
+        "path",
+        "expires",
+        "expiry",
+        "http_only",
+        "httponly",
+        "secure",
+        "same_site",
+        "samesite",
+        "host_only",
+        "hostonly",
+        "session",
+    }
+    if cookie_attributes.intersection(normalized):
+        return True
+    domain = normalized.get("domain")
+    if "domain" in normalized and isinstance(domain, str):
+        return True
+    name = str(normalized["name"]).casefold()
+    return (
+        name in {"sid", "session", "sessionid", "phpsessid", "jsessionid"}
+        or name.startswith(("__host-", "__secure-", "_ga", "_gid"))
+        or any(part in name for part in ("session", "csrf", "xsrf", "auth", "token", "cookie"))
+    )
 
 
 def normalize_adapter_error(exc: BaseException) -> AdapterError:
