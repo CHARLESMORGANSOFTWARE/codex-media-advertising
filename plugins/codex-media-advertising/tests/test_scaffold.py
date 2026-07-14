@@ -26,6 +26,10 @@ def test_manifest_discovers_skills():
     assert data["skills"] == "./skills/"
 
 
+def test_skills_discovery_path_survives_fresh_checkout():
+    assert (PLUGIN / "skills" / ".gitkeep").is_file()
+
+
 def test_checkout_contains_no_private_state_directories():
     forbidden = {"secrets", "browser-profiles", "generated", "receipts", "queue", "logs"}
     assert not forbidden.intersection(path.name for path in PLUGIN.iterdir())
