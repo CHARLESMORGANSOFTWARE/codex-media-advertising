@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codex-media-advertising"
+version = "0.1.0"
+description = "Local media creation and social publishing automation for Codex"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+dependencies = [
+  "pydantic>=2.10,<3",
+  "requests>=2.32,<3",
+  "platformdirs>=4.3,<5",
+]
+
+[project.optional-dependencies]
+browser = ["playwright>=1.54,<2"]
+youtube = [
+  "google-api-python-client>=2.170,<3",
+  "google-auth-oauthlib>=1.2,<2",
+]
+test = ["pytest>=8.3,<9", "pytest-cov>=6,<7"]
+
+[project.scripts]
+codex-media-ads = "codex_media_ads.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codex_media_ads"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
