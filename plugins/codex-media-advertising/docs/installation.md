@@ -7,21 +7,32 @@ installation. API and browser extras are optional per destination.
 ## Install from GitHub
 
 ```bash
-git clone https://github.com/ORG/codex-media-advertising.git
+git clone https://github.com/CHARLESMORGANSOFTWARE/codex-media-advertising.git
 cd codex-media-advertising
+codex plugin marketplace add "$PWD"
+codex plugin add codex-media-advertising@codex-media-advertising
 ./plugins/codex-media-advertising/scripts/install.sh
 ```
 
-Add the checkout's marketplace to Codex using the Codex plugin marketplace
-command or the Plugins UI, then install `codex-media-advertising` from that
-marketplace. Start a new Codex task after installation and invoke
-`$media-onboarding`; a task that started before installation does not reliably
-discover newly installed skills.
+The two `codex plugin` commands add the checkout as a marketplace and install
+the plugin under its exact marketplace name. Start a new Codex task after
+installation and invoke `$media-onboarding`; a task that started before
+installation does not reliably discover newly installed skills.
 
-The installer creates an isolated Python environment, installs the package and
-optional local dependencies available on the machine, and leaves all runtime
-state outside the checkout. It does not create credentials, launch jobs, or
-publish anything.
+The installer creates an isolated Python environment and installs the base
+package. It does not install the optional `browser` or `youtube` Python extras;
+install those explicitly when you need Playwright browser publishing or the
+YouTube API route:
+
+```bash
+"$HOME/.local/share/codex-media-ads/venv/bin/python" -m pip install --upgrade \
+  "./plugins/codex-media-advertising[browser,youtube]"
+```
+
+FFmpeg/ffprobe, Chrome/Chromium, and the Codimage and narration providers are
+external prerequisites checked by `codex-media-ads setup`. The installer leaves
+all runtime state outside the checkout. It does not create credentials, launch
+jobs, or publish anything.
 
 ## First setup
 

@@ -94,3 +94,13 @@ def test_user_documentation_covers_install_auth_automation_and_platforms() -> No
         assert platform in docs["platform-notes.md"]
     assert "private-only" in docs["platform-notes.md"]
     assert "unknown" in docs["platform-notes.md"]
+
+
+def test_installation_docs_use_public_marketplace_commands_and_accurate_extras() -> None:
+    text = (PLUGIN / "docs" / "installation.md").read_text()
+
+    assert "https://github.com/CHARLESMORGANSOFTWARE/codex-media-advertising.git" in text
+    assert 'codex plugin marketplace add "$PWD"' in text
+    assert "codex plugin add codex-media-advertising@codex-media-advertising" in text
+    assert "does not install the optional `browser` or `youtube` Python extras" in text
+    assert "optional local dependencies available on the machine" not in text
