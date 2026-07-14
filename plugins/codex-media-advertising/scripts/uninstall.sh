@@ -44,6 +44,33 @@ case "$INSTALL_ROOT:$STATE_ROOT" in
         ;;
 esac
 
+canonical_path() {
+    /usr/bin/python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
+
+[ -x /usr/bin/python3 ] || unsafe_install_root "cannot resolve physical paths"
+HOME_PHYSICAL=$(canonical_path "$HOME") || unsafe_install_root "cannot resolve HOME"
+INSTALL_PHYSICAL=$(canonical_path "$INSTALL_ROOT") || unsafe_install_root "cannot resolve install path"
+STATE_PHYSICAL=$(canonical_path "$STATE_ROOT") || unsafe_install_root "cannot resolve state path"
+
+case "$INSTALL_PHYSICAL" in
+    "$HOME_PHYSICAL"/*/codex-media-ads) ;;
+    *) unsafe_install_root "physical path must be a plugin-named descendant of HOME" ;;
+esac
+
+is_same_or_descendant() {
+    [ "$1" = "$2" ] && return 0
+    case "$1" in
+        "$2"/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+if is_same_or_descendant "$INSTALL_PHYSICAL" "$STATE_PHYSICAL" ||
+    is_same_or_descendant "$STATE_PHYSICAL" "$INSTALL_PHYSICAL"; then
+    unsafe_install_root "physical path overlaps private state"
+fi
+
 component=$INSTALL_ROOT
 while [ "$component" != "$HOME" ]; do
     [ ! -L "$component" ] || unsafe_install_root "path contains a symlink"

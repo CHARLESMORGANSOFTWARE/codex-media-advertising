@@ -680,14 +680,46 @@ class BrowserPublisher:
             return self._blocked(identity, observed_identity=probe.observed_identity)
 
         if request.dry_run:
+            required_controls = ("upload", "submit")
+            controls = {purpose: False for purpose in required_controls}
             try:
-                controls = {
-                    purpose: self.page.is_visible(locator)
-                    for purpose, locator in self._locators.items()
-                    if purpose in {"upload", "submit"}
-                }
+                for purpose in required_controls:
+                    controls[purpose] = bool(
+                        self.page.is_visible(self._locator(purpose))
+                    )
             except Exception as exc:
-                return self._failure(exc)
+                return PublishResult(
+                    status=PublishStatus.FAILED,
+                    error_category=ErrorCategory.PLATFORM_UI.value,
+                    evidence={
+                        "dry_run": True,
+                        "final_action_skipped": False,
+                        "observed_identity": probe.observed_identity,
+                        "media_validated": True,
+                        "controls_ready": False,
+                        "controls": controls,
+                    },
+                    detail=f"browser control readiness check failed: {type(exc).__name__}",
+                )
+            controls_ready = all(controls.values())
+            if not controls_ready:
+                return PublishResult(
+                    status=PublishStatus.BLOCKED,
+                    error_category=ErrorCategory.PLATFORM_UI.value,
+                    evidence={
+                        "dry_run": True,
+                        "final_action_skipped": False,
+                        "observed_identity": probe.observed_identity,
+                        "media_validated": True,
+                        "controls_ready": False,
+                        "controls": controls,
+                        "next_action": (
+                            "Open the configured composer and verify the upload "
+                            "and final submit controls."
+                        ),
+                    },
+                    detail="required browser publishing controls are not ready",
+                )
             return PublishResult(
                 status=PublishStatus.SKIPPED,
                 evidence={
@@ -695,6 +727,7 @@ class BrowserPublisher:
                     "final_action_skipped": True,
                     "observed_identity": probe.observed_identity,
                     "media_validated": True,
+                    "controls_ready": True,
                     "controls": controls,
                 },
                 detail="dry run completed without uploading or submitting",

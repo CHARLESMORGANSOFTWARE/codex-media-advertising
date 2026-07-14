@@ -137,6 +137,37 @@ def test_setup_never_enables_background_when_a_dependency_is_missing(
     assert result.channels["instagram"].background_enabled is False
 
 
+def test_setup_browser_channel_requires_affirmative_controls_readiness(
+    tmp_path: Path,
+) -> None:
+    service = _service(
+        tmp_path,
+        dry_runs={
+            "instagram": lambda: PublishResult(
+                status=PublishStatus.SKIPPED,
+                evidence={
+                    "dry_run": True,
+                    "final_action_skipped": True,
+                    "controls_ready": False,
+                    "controls": {"upload": True, "submit": False},
+                },
+            )
+        },
+    )
+
+    result = service.configure(
+        enabled=["instagram"],
+        channels={
+            "instagram": {
+                "expected_identity": "creator@example.test",
+                "mode": "browser",
+            }
+        },
+    )
+
+    assert result.channels["instagram"].background_enabled is False
+
+
 def test_checks_report_ok_blocked_and_missing_without_real_subprocesses(
     tmp_path: Path,
 ) -> None:

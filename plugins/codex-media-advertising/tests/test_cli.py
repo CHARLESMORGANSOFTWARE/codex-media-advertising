@@ -428,14 +428,18 @@ def test_automation_install_is_blocked_until_setup_proves_live_gates(
     assert payload["status"] == "blocked"
 
 
+@pytest.mark.parametrize(
+    ("controls_ready", "expected_exit"),
+    [(True, 0), (False, 3)],
+)
 def test_noninjected_setup_uses_configured_runtime_probe_narration_and_dry_run(
-    capsys, tmp_path: Path, monkeypatch
+    capsys, tmp_path: Path, monkeypatch, controls_ready: bool, expected_exit: int
 ) -> None:
     events: list[str] = []
     account = AccountConfig(
         account_id="runtime-x",
         expected_identity="runtime-creator",
-        mode="api",
+        mode="browser",
     )
 
     class Adapter:
@@ -457,7 +461,12 @@ def test_noninjected_setup_uses_configured_runtime_probe_narration_and_dry_run(
             events.append("dry-run")
             return PublishResult(
                 status=PublishStatus.SKIPPED,
-                evidence={"dry_run": True, "final_action_skipped": True},
+                evidence={
+                    "dry_run": True,
+                    "final_action_skipped": True,
+                    "controls_ready": controls_ready,
+                    "controls": {"upload": True, "submit": controls_ready},
+                },
             )
 
     adapter = Adapter()
@@ -528,10 +537,10 @@ def test_noninjected_setup_uses_configured_runtime_probe_narration_and_dry_run(
     )
     payload = json.loads(capsys.readouterr().out)
 
-    assert exit_code == 0, (payload, events)
-    assert payload["status"] == "ready"
+    assert exit_code == expected_exit, (payload, events)
+    assert payload["status"] == ("ready" if controls_ready else "blocked")
     assert payload["checks"]["chrome"]["status"] == "ok"
-    assert payload["channels"]["x"]["background_enabled"] is True
+    assert payload["channels"]["x"]["background_enabled"] is controls_ready
     assert {"probe", "narration", "dry-run"}.issubset(events)
     saved = json.loads((tmp_path / "state" / "config" / "setup.json").read_text())
     assert saved["channels"]["x"]["expected_identity"] == "runtime-creator"

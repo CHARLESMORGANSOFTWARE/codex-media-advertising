@@ -65,3 +65,36 @@ Implemented rerunnable setup checks, private secret import, conservative backgro
 - Temporary-HOME install and uninstall dry-runs passed without mutation or `launchctl`.
 - Negative uninstall dry-runs rejected `/`, HOME, state root, and a state descendant with exit `2`.
 - CLI help, `compileall -q`, `sh -n`, and `git diff --check` passed.
+
+## Final review remediation
+
+### RED evidence
+
+- The final focused regression started at `16 failed, 1 passed`: twelve browser
+  upload/submit readiness cases, one direct setup gate, one non-injected setup
+  gate, and two physical uninstall alias cases.
+
+### Remediations
+
+- Browser dry-runs now inspect both required upload and final-submit controls.
+  They return `skipped` with `final_action_skipped=true` only when both controls
+  are visible; missing controls block with affirmative false evidence, and
+  readiness-inspection errors fail safely with the same false evidence.
+- Browser-mode setup independently requires `controls_ready=true` plus exact
+  `upload=true` and `submit=true` evidence before background automation can be
+  enabled. The non-injected production setup regression covers both the ready
+  and blocked paths.
+- Uninstall resolves HOME, install, and private-state paths physically before
+  any dry-run output, CLI invocation, `launchctl`, or deletion. Canonical
+  install/state overlap is rejected for both lexical `..` aliases and symlink
+  aliases.
+
+### Verification
+
+- Focused RED-to-GREEN slice: `17 passed`.
+- Browser/setup/CLI/LaunchAgent regression: `265 passed`.
+- Full plugin suite: `509 passed in 1.86s`.
+- Temporary-HOME install and uninstall positive dry-runs passed.
+- Temporary-HOME `..` and symlink overlap smokes each exited `2`, preserved the
+  install sentinel, and did not invoke `launchctl`.
+- CLI help, `compileall -q`, `sh -n`, and `git diff --check` passed.

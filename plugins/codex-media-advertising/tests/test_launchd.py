@@ -391,3 +391,50 @@ def test_uninstall_allows_safe_root_when_home_has_symlinked_ancestor(
     )
 
     assert result.returncode == 0
+
+
+@pytest.mark.parametrize("alias_kind", ["dotdot", "symlink"])
+def test_uninstall_rejects_physical_state_overlap_before_any_action(
+    tmp_path: Path, alias_kind: str
+) -> None:
+    home = tmp_path / "home"
+    install_root = home / "custom" / "codex-media-ads"
+    install_root.mkdir(parents=True)
+    sentinel = install_root / "keep.txt"
+    sentinel.write_text("keep")
+    target_state = install_root / "private-state"
+    target_state.mkdir()
+    if alias_kind == "dotdot":
+        state_root = home / "placeholder" / ".." / "custom" / "codex-media-ads" / "private-state"
+    else:
+        state_root = home / "state-alias"
+        state_root.symlink_to(target_state, target_is_directory=True)
+    marker = tmp_path / "launchctl-called"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_launchctl = fake_bin / "launchctl"
+    fake_launchctl.write_text(f"#!/bin/sh\ntouch '{marker}'\n")
+    fake_launchctl.chmod(0o700)
+    script = Path(__file__).parents[1] / "scripts" / "uninstall.sh"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:{environment.get('PATH', '')}",
+            "CODEX_MEDIA_ADS_STATE_ROOT": str(state_root),
+            "CODEX_MEDIA_ADS_INSTALL_ROOT": str(install_root),
+        }
+    )
+
+    result = subprocess.run(
+        ["/bin/sh", str(script), "--dry-run"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "unsafe install root" in result.stderr
+    assert sentinel.read_text() == "keep"
+    assert not marker.exists()

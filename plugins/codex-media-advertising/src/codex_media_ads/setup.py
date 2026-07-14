@@ -356,11 +356,22 @@ class SetupService:
         return ready
 
     @staticmethod
-    def _dry_run_safe(result: PublishResult) -> bool:
-        return (
+    def _dry_run_safe(
+        result: PublishResult, *, require_controls: bool = False
+    ) -> bool:
+        safe = (
             result.status == PublishStatus.SKIPPED
             and result.evidence.get("dry_run") is True
             and result.evidence.get("final_action_skipped") is True
+        )
+        if not safe or not require_controls:
+            return safe
+        controls = result.evidence.get("controls")
+        return (
+            result.evidence.get("controls_ready") is True
+            and isinstance(controls, Mapping)
+            and controls.get("upload") is True
+            and controls.get("submit") is True
         )
 
     def configure(
@@ -405,8 +416,14 @@ class SetupService:
                 probe and probe_identity(expected, probe.observed_identity).ok
             )
             dry_run = self.dry_runs.get(name)
+            mode = str(settings.get("mode", "auto")).strip().casefold()
             try:
-                dry_run_ok = bool(dry_run and self._dry_run_safe(dry_run()))
+                dry_run_ok = bool(
+                    dry_run
+                    and self._dry_run_safe(
+                        dry_run(), require_controls=mode == "browser"
+                    )
+                )
             except Exception:
                 dry_run_ok = False
             enabled_in_background = (

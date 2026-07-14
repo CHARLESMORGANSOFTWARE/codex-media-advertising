@@ -752,13 +752,34 @@ def test_missing_media_blocks_before_upload(tmp_path: Path, platform: str) -> No
 
 def test_dry_run_never_submits_and_returns_evidence(tmp_path: Path, platform: str) -> None:
     page = FakePage()
+    page.visible.update({"upload", "submit"})
     result = make_publisher(platform, page).publish(
         publish_request(tmp_path, platform, dry_run=True)
     )
     assert result.status == PublishStatus.SKIPPED
     assert result.evidence["dry_run"] is True
     assert result.evidence["final_action_skipped"] is True
+    assert result.evidence["controls_ready"] is True
     assert not page.submit_clicked
+    assert not any(action[0] == "upload" for action in page.actions)
+
+
+@pytest.mark.parametrize("missing", ["upload", "submit"])
+def test_dry_run_blocks_when_required_publish_control_is_not_visible(
+    tmp_path: Path, platform: str, missing: str
+) -> None:
+    page = FakePage()
+    page.visible.update({"upload", "submit"} - {missing})
+
+    result = make_publisher(platform, page).publish(
+        publish_request(tmp_path, platform, dry_run=True)
+    )
+
+    assert result.status == PublishStatus.BLOCKED
+    assert result.error_category == ErrorCategory.PLATFORM_UI
+    assert result.evidence["controls"][missing] is False
+    assert result.evidence["controls_ready"] is False
+    assert result.evidence.get("final_action_skipped") is not True
     assert not any(action[0] == "upload" for action in page.actions)
 
 
