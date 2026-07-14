@@ -30,3 +30,4 @@ packages = ["src/codex_media_ads"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["integration: uses local installed media executables"]
