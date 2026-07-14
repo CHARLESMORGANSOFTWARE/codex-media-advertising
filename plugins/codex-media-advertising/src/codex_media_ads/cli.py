@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import sys
 from pathlib import Path
 
 from pydantic import ValidationError
 
+from .automation.launchd import LaunchdBuilder, LaunchdManager, Schedule
 from .config import redact
 from .manifests import load_campaign
 from .models import PublishRequest, PublishResult, PublishStatus
@@ -14,6 +17,7 @@ from .orchestrator import Orchestrator
 from .publishing.base import ErrorCategory, redact_diagnostic
 from .queueing import EnqueueResult
 from .runtime import RuntimeConfigurationError, load_runtime
+from .setup import SetupService, result_payload as setup_result_payload
 
 __version__ = "0.1.0"
 
@@ -36,6 +40,32 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command")
 
+    setup = commands.add_parser("setup", help="Check dependencies and configure channels")
+    setup.add_argument("--enable", action="append", default=[], metavar="PLATFORM")
+    setup.add_argument("--config", type=Path, help="Nonsecret channel configuration JSON")
+    setup.add_argument(
+        "--import-secret",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help="Copy a credential file into private state without printing it",
+    )
+    setup.add_argument("--format", choices=("json", "text"), default="json")
+
+    automation = commands.add_parser("automation", help="Manage background jobs")
+    automation_commands = automation.add_subparsers(
+        dest="automation_command", required=True
+    )
+    install = _leaf(automation_commands, "install", "Install a user LaunchAgent")
+    install.add_argument("name", choices=("daily-short",))
+    schedule_group = install.add_mutually_exclusive_group()
+    schedule_group.add_argument("--interval", type=int)
+    schedule_group.add_argument("--hour", type=int, default=9)
+    install.add_argument("--minute", type=int, default=0)
+    _leaf(automation_commands, "list", "List plugin-owned user LaunchAgents")
+    remove = _leaf(automation_commands, "remove", "Remove a plugin-owned user LaunchAgent")
+    remove.add_argument("name", choices=("daily-short",))
+
     campaign = commands.add_parser("campaign", help="Validate or build campaigns")
     campaign_commands = campaign.add_subparsers(dest="campaign_command", required=True)
     validate = _leaf(campaign_commands, "validate", "Validate a campaign manifest")
@@ -54,6 +84,7 @@ def _build_parser() -> argparse.ArgumentParser:
     publish_commands = publish.add_subparsers(dest="publish_command", required=True)
     next_parser = _leaf(publish_commands, "next", "Process the next queued request")
     next_parser.add_argument("--dry-run", action="store_true")
+    next_parser.add_argument("--schedule", help="Background schedule provenance marker")
     probe = _leaf(publish_commands, "probe", "Probe a configured platform identity")
     probe.add_argument("--platform", required=True)
 
@@ -112,6 +143,45 @@ def _runtime(
     return load_runtime(
         state_root,
         require_configuration=require_configuration,
+    )
+
+
+def _launchd_manager() -> LaunchdManager:
+    configured = os.environ.get("CODEX_MEDIA_ADS_EXECUTABLE")
+    discovered = shutil.which("codex-media-ads")
+    executable = Path(configured or discovered or (Path(sys.executable).parent / "codex-media-ads"))
+    plugin_root = Path(__file__).resolve().parents[2]
+    return LaunchdManager(
+        LaunchdBuilder(executable=executable, working_directory=plugin_root)
+    )
+
+
+def _channel_config(path: Path | None) -> dict[str, dict[str, object]]:
+    if path is None:
+        return {}
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict):
+        raise ValueError("setup configuration must be a JSON object")
+    channels = value.get("channels", value)
+    if not isinstance(channels, dict) or any(
+        not isinstance(item, dict) for item in channels.values()
+    ):
+        raise ValueError("setup channels must be JSON objects")
+    return {str(name): dict(item) for name, item in channels.items()}
+
+
+def _background_ready(state_root: Path) -> bool:
+    path = state_root / "config" / "setup.json"
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    channels = value.get("channels") if isinstance(value, dict) else None
+    return bool(channels) and isinstance(channels, dict) and all(
+        isinstance(channel, dict) and channel.get("background_enabled") is True
+        for channel in channels.values()
     )
 
 
@@ -184,7 +254,11 @@ def _account_id(service: Orchestrator, platform: str, supplied: str) -> str:
 
 
 def main(
-    argv: list[str] | None = None, *, orchestrator: Orchestrator | None = None
+    argv: list[str] | None = None,
+    *,
+    orchestrator: Orchestrator | None = None,
+    setup_service: SetupService | None = None,
+    launchd_manager: LaunchdManager | None = None,
 ) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -200,6 +274,85 @@ def main(
 
     output_format = getattr(args, "format", "json")
     try:
+        if args.command == "setup":
+            setup_service = setup_service or SetupService(args.state_root)
+            imported: list[str] = []
+            for specification in args.import_secret:
+                if "=" not in specification:
+                    raise ValueError("secret import must use NAME=PATH")
+                name, source = specification.split("=", 1)
+                destination = setup_service.import_secret(Path(source), name)
+                imported.append(str(destination))
+            result = setup_service.configure(
+                enabled=args.enable,
+                channels=_channel_config(args.config),
+            )
+            payload = setup_result_payload(result)
+            if imported:
+                payload["imported_secret_files"] = imported
+            _emit(payload, output_format)
+            return 0 if payload["ok"] else 3
+
+        if args.command == "automation":
+            launchd_manager = launchd_manager or _launchd_manager()
+            if args.automation_command == "install":
+                if not _background_ready(args.state_root):
+                    _emit(
+                        _failure(
+                            status="blocked",
+                            category="configuration",
+                            detail="Background automation has not passed the setup gates.",
+                            next_action=(
+                                "Run codex-media-ads setup and resolve every blocked "
+                                "check before installing automation."
+                            ),
+                        ),
+                        output_format,
+                    )
+                    return 3
+                schedule = (
+                    Schedule(interval=args.interval)
+                    if args.interval is not None
+                    else Schedule(calendar={"Hour": args.hour, "Minute": args.minute})
+                )
+                path = launchd_manager.install(
+                    args.name, state_root=args.state_root, schedule=schedule
+                )
+                _emit(
+                    {
+                        "ok": True,
+                        "status": "installed",
+                        "automation": args.name,
+                        "plist": str(path),
+                    },
+                    output_format,
+                )
+                return 0
+            if args.automation_command == "list":
+                _emit(
+                    {
+                        "ok": True,
+                        "status": "ok",
+                        "automations": launchd_manager.list(),
+                    },
+                    output_format,
+                )
+                return 0
+            if args.automation_command == "remove":
+                removed = launchd_manager.remove(
+                    args.name, state_root=args.state_root
+                )
+                _emit(
+                    {
+                        "ok": True,
+                        "status": "removed" if removed else "not-installed",
+                        "automation": args.name,
+                        "state_preserved": True,
+                    },
+                    output_format,
+                )
+                return 0
+
         if args.command == "campaign" and args.campaign_command == "validate":
             campaign = load_campaign(args.campaign)
             _emit(

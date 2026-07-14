@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from codex_media_ads import cli
+from codex_media_ads.automation.launchd import LaunchdBuilder, LaunchdManager
 from codex_media_ads.creative.pipeline import CreativePipeline
 from codex_media_ads.creative.providers import CodimageProvider, CommandNarrationProvider
 from codex_media_ads.models import (
@@ -145,6 +146,10 @@ def run_cli(capsys, args: list[str], orchestrator=None):
 @pytest.mark.parametrize(
     "args",
     [
+        ["setup", "--help"],
+        ["automation", "install", "--help"],
+        ["automation", "list", "--help"],
+        ["automation", "remove", "--help"],
         ["campaign", "validate", "--help"],
         ["campaign", "build", "--help"],
         ["queue", "add", "--help"],
@@ -330,6 +335,96 @@ def test_publish_next_dry_run_marks_the_attempt_receipt(
     receipt = orchestrator.receipts()[-1]
     assert receipt["dry_run"] is True
     assert receipt["status"] == "skipped"
+
+
+def test_publish_next_accepts_launchagent_schedule_marker(
+    capsys, orchestrator
+) -> None:
+    exit_code, payload = run_cli(
+        capsys,
+        ["publish", "next", "--schedule", "daily-short"],
+        orchestrator,
+    )
+
+    assert exit_code == 0
+    assert payload["status"] == "skipped"
+
+
+def test_automation_cli_uses_injected_manager_without_real_launchctl(
+    capsys, tmp_path: Path
+) -> None:
+    executable = tmp_path / "bin" / "codex-media-ads"
+    executable.parent.mkdir()
+    executable.touch()
+    workdir = tmp_path / "plugin"
+    workdir.mkdir()
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    manager = LaunchdManager(
+        LaunchdBuilder(executable=executable, working_directory=workdir),
+        launch_agents_dir=tmp_path / "LaunchAgents",
+        run=run,
+        uid=501,
+    )
+    setup_config = tmp_path / "state" / "config" / "setup.json"
+    setup_config.parent.mkdir(parents=True)
+    setup_config.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "channels": {"x": {"background_enabled": True}},
+            }
+        )
+    )
+
+    exit_code = cli.main(
+        [
+            "--state-root",
+            str(tmp_path / "state"),
+            "automation",
+            "install",
+            "daily-short",
+        ],
+        launchd_manager=manager,
+    )
+    installed = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert installed["status"] == "installed"
+    assert calls[0][0][:3] == ["launchctl", "bootstrap", "gui/501"]
+
+    exit_code = cli.main(
+        ["automation", "list"], launchd_manager=manager
+    )
+    listed = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert listed["automations"] == ["daily-short"]
+
+
+def test_automation_install_is_blocked_until_setup_proves_live_gates(
+    capsys, tmp_path: Path
+) -> None:
+    class NeverInstall:
+        def install(self, *args, **kwargs):
+            raise AssertionError("LaunchAgent must not be installed")
+
+    exit_code = cli.main(
+        [
+            "--state-root",
+            str(tmp_path / "state"),
+            "automation",
+            "install",
+            "daily-short",
+        ],
+        launchd_manager=NeverInstall(),
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 3
+    assert payload["status"] == "blocked"
 
 
 def test_publish_next_unknown_is_failed_exit_four(
