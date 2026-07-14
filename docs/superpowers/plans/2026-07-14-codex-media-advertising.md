@@ -1031,7 +1031,7 @@ Before enabling a live job, setup must pass a synthetic FFmpeg render, adapter a
 
 Generate reverse-DNS labels under the default namespace `com.codex-media-ads`. For the `daily-short` automation, `ProgramArguments` call `codex-media-ads publish next --schedule daily-short --format json`. Use `StartCalendarInterval` or `StartInterval`, `RunAtLoad=false`, and log paths beneath the private state root. Write the plist atomically to `~/Library/LaunchAgents/com.codex-media-ads.daily-short.plist` and load it with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.codex-media-ads.daily-short.plist`.
 
-Removal uses `launchctl bootout gui/<uid> <plist>` and deletes only plugin-owned plist files. It preserves campaigns, media, receipts, and secrets unless the user separately requests state deletion.
+Removal uses `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.codex-media-ads.daily-short.plist` and deletes only plugin-owned plist files. It preserves campaigns, media, receipts, and secrets unless the user separately requests state deletion.
 
 - [ ] **Step 4: Run setup tests and a temporary-home installer smoke**
 
