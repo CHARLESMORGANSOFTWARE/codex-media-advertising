@@ -1,0 +1,4 @@
+interface:
+  display_name: "Media Publishing"
+  short_description: "Publish posts with receipt evidence"
+  default_prompt: "Use $media-publishing to publish and verify campaign receipts."

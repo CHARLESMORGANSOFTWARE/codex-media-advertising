@@ -1,0 +1,4 @@
+interface:
+  display_name: "Media Campaign"
+  short_description: "Turn a brief into validated media"
+  default_prompt: "Use $media-campaign to build a rights-cleared campaign."

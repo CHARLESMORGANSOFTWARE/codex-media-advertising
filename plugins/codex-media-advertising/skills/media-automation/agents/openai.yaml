@@ -1,0 +1,4 @@
+interface:
+  display_name: "Media Automation"
+  short_description: "Schedule safe background publishing"
+  default_prompt: "Use $media-automation to schedule my campaign safely."

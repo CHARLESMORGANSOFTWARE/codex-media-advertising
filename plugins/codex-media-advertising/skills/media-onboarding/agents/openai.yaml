@@ -1,0 +1,4 @@
+interface:
+  display_name: "Media Onboarding"
+  short_description: "Connect media tools and publishing accounts"
+  default_prompt: "Use $media-onboarding to configure my media automation safely."

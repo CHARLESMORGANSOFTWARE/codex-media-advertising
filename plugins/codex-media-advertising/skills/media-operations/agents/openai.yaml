@@ -1,0 +1,4 @@
+interface:
+  display_name: "Media Operations"
+  short_description: "Diagnose media automation safely"
+  default_prompt: "Use $media-operations to diagnose a blocked media run."
