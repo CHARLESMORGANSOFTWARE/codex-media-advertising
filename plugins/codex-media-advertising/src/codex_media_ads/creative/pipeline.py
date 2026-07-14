@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Literal
@@ -93,16 +92,8 @@ def _renderer_identity(
     return ["custom-renderer-without-cache-identity"], False
 
 
-_SENSITIVE_ASSIGNMENT = re.compile(
-    r"(?i)\b(token|secret|password|cookie|authorization|api_key)\s*[:=]\s*[^\s,;]+"
-)
-
-
 def _safe_exception_detail(exc: Exception) -> str:
-    message = _SENSITIVE_ASSIGNMENT.sub(
-        lambda match: f"{match.group(1)}=[REDACTED]", str(exc)
-    )
-    return f"{type(exc).__name__}: {message}"[:1000]
+    return f"{type(exc).__name__}: stage execution failed"
 
 
 def _failure(error_category: str, stage: str, detail: str) -> dict[str, object]:
@@ -149,6 +140,29 @@ class CreativePipeline:
                 "campaign build directory must be a strict descendant of output_root"
             )
         return candidate
+
+    @staticmethod
+    def _validate_output_targets(build_dir: Path, targets: list[Path]) -> None:
+        for target in targets:
+            try:
+                relative = target.relative_to(build_dir)
+            except ValueError as exc:
+                raise ValueError(
+                    "output target escapes campaign build directory"
+                ) from exc
+            current = build_dir
+            for part in relative.parts:
+                current = current / part
+                if current.is_symlink():
+                    raise ValueError(
+                        f"symlinked output component is forbidden: {current}"
+                    )
+            try:
+                target.resolve().relative_to(build_dir)
+            except ValueError as exc:
+                raise ValueError(
+                    "output target escapes campaign build directory"
+                ) from exc
 
     @staticmethod
     def _write_manifest(
@@ -246,6 +260,27 @@ class CreativePipeline:
         manifest_path = build_dir / "build-manifest.json"
         master_path = build_dir / "master.mp4"
         audio_path = build_dir / "narration.wav"
+        image_paths = [
+            images_dir / f"scene-{index:03d}.png"
+            for index, _ in enumerate(campaign.visual_prompts, 1)
+        ]
+        variant_targets = {
+            destination: variants_dir / f"{destination}.mp4"
+            for destination in campaign.destinations
+        }
+        self._validate_output_targets(
+            build_dir,
+            [
+                images_dir,
+                variants_dir,
+                manifest_path,
+                master_path,
+                master_path.with_suffix(".concat.txt"),
+                audio_path,
+                *image_paths,
+                *variant_targets.values(),
+            ],
+        )
         build_dir.mkdir(parents=True, exist_ok=True)
         images_dir.mkdir(parents=True, exist_ok=True)
         variants_dir.mkdir(parents=True, exist_ok=True)
@@ -260,10 +295,6 @@ class CreativePipeline:
             campaign.model_dump(mode="json", exclude={"content_id"})
         )
 
-        image_paths = [
-            (images_dir / f"scene-{index:03d}.png").resolve()
-            for index, _ in enumerate(campaign.visual_prompts, 1)
-        ]
         image_input_hash = _sha_json(campaign.visual_prompts)
         image_command_hash = _sha_json(_command_identity(self.image_provider))
         previous_images = previous_stages.get("images", {})
@@ -459,7 +490,7 @@ class CreativePipeline:
         master_hash = _sha_file(master_path)
         for destination in campaign.destinations:
             stage_name = f"variant:{destination}"
-            variant_path = (variants_dir / f"{destination}.mp4").resolve()
+            variant_path = variant_targets[destination]
             variant_input_hash = _sha_json(
                 {"master": master_hash, "destination": destination}
             )

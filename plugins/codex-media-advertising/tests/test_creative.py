@@ -336,6 +336,16 @@ class ExplodingNarration:
         raise RuntimeError("password=hunter2")
 
 
+class CredentialLeakingNarration:
+    command_identity = ["credential-leaking-narration-v1"]
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+
+    def synthesize(self, text: str, output_path: Path, voice: str) -> Path:
+        raise RuntimeError(self.message)
+
+
 def exploding_master(images, audio, output, **kwargs):
     raise RuntimeError("master encoder unavailable")
 
@@ -366,6 +376,31 @@ def test_narration_failure_returns_failed_stage_and_redacted_failure(
     assert result.failure["stage"] == "narration"
     assert "hunter2" not in json.dumps(result.failure)
     assert "render" not in result.stages
+
+
+@pytest.mark.parametrize(
+    ("message", "secret_values"),
+    [
+        ("Authorization: Bearer abc123", ["Bearer", "abc123"]),
+        ('password="two secret words"', ["two", "secret", "words"]),
+    ],
+)
+def test_failure_detail_never_persists_multi_token_or_quoted_credentials(
+    tmp_path: Path, campaign, message: str, secret_values: list[str]
+):
+    pipeline = CreativePipeline(
+        output_root=tmp_path / "build",
+        image_provider=FakeImages(),
+        narration_provider=CredentialLeakingNarration(message),
+        master_renderer=fake_master,
+        variant_renderer=fake_variant,
+    )
+
+    result = pipeline.build(campaign)
+    persisted = result.manifest_path.read_text()
+
+    assert result.failure["detail"] == "RuntimeError: stage execution failed"
+    assert all(value not in persisted for value in secret_values)
 
 
 def test_master_failure_returns_failed_render_stage(tmp_path: Path, campaign):
@@ -475,6 +510,50 @@ def test_symlinked_campaign_directory_cannot_escape_output_root(
         pipeline.build(campaign)
     assert images.calls == 0
     assert not (outside / "campaign").exists()
+
+
+@pytest.mark.parametrize(
+    ("component", "is_directory"),
+    [
+        ("images", True),
+        ("variants", True),
+        ("narration.wav", False),
+        ("build-manifest.json", False),
+    ],
+)
+def test_nested_output_symlink_is_rejected_before_any_pipeline_side_effect(
+    tmp_path: Path, campaign, component: str, is_directory: bool
+):
+    output_root = tmp_path / "build"
+    build_dir = output_root / campaign.campaign_id
+    outside = tmp_path / "outside"
+    build_dir.mkdir(parents=True)
+    outside.mkdir()
+    external_target = outside / f"escaped-{component.replace('.', '-')}"
+    if is_directory:
+        external_target.mkdir()
+    (build_dir / component).symlink_to(
+        external_target, target_is_directory=is_directory
+    )
+    outside_before = sorted(
+        path.relative_to(outside) for path in outside.rglob("*")
+    )
+    images = CountingImages()
+    pipeline = CreativePipeline(
+        output_root=output_root,
+        image_provider=images,
+        narration_provider=FakeNarration(),
+        master_renderer=fake_master,
+        variant_renderer=fake_variant,
+    )
+
+    with pytest.raises(ValueError, match="symlinked output component"):
+        pipeline.build(campaign)
+
+    assert images.calls == 0
+    assert sorted(
+        path.relative_to(outside) for path in outside.rglob("*")
+    ) == outside_before
 
 
 def test_changed_codimage_project_and_job_file_rebuild_images(
