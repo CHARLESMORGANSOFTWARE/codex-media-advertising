@@ -4,7 +4,6 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Any
 
 from pydantic import ValidationError
 
@@ -12,8 +11,9 @@ from .config import redact
 from .manifests import load_campaign
 from .models import PublishRequest, PublishResult, PublishStatus
 from .orchestrator import Orchestrator
-from .publishing.base import redact_diagnostic
-from .queueing import EnqueueResult, QueueStore
+from .publishing.base import ErrorCategory, redact_diagnostic
+from .queueing import EnqueueResult
+from .runtime import RuntimeConfigurationError, load_runtime
 
 __version__ = "0.1.0"
 
@@ -101,20 +101,33 @@ def _emit(payload: dict[str, object], output_format: str) -> None:
         print(f"{key}: {value}")
 
 
-def _runtime(state_root: Path, supplied: Orchestrator | None) -> Orchestrator:
+def _runtime(
+    state_root: Path,
+    supplied: Orchestrator | None,
+    *,
+    require_configuration: bool = False,
+) -> Orchestrator:
     if supplied is not None:
         return supplied
-    return Orchestrator(queue_store=QueueStore(state_root))
+    return load_runtime(
+        state_root,
+        require_configuration=require_configuration,
+    )
 
 
 def _result_payload(result: PublishResult) -> dict[str, object]:
-    ok = result.status not in {PublishStatus.BLOCKED, PublishStatus.FAILED}
+    failed = result.status in {PublishStatus.FAILED, PublishStatus.UNKNOWN}
+    ok = result.status != PublishStatus.BLOCKED and not failed
     payload: dict[str, object] = {
         "ok": ok,
-        "status": result.status.value,
+        "status": PublishStatus.FAILED.value if failed else result.status.value,
     }
-    if result.error_category:
-        payload["error_category"] = result.error_category
+    if result.error_category or result.status == PublishStatus.UNKNOWN:
+        payload["error_category"] = (
+            ErrorCategory.AMBIGUOUS_SUBMIT.value
+            if result.status == PublishStatus.UNKNOWN
+            else result.error_category
+        )
     if result.detail:
         payload["detail"] = result.detail
     next_action = result.evidence.get("next_action")
@@ -140,7 +153,7 @@ def _result_payload(result: PublishResult) -> dict[str, object]:
 def _result_exit(result: PublishResult) -> int:
     if result.status == PublishStatus.BLOCKED:
         return 3
-    if result.status == PublishStatus.FAILED:
+    if result.status in {PublishStatus.FAILED, PublishStatus.UNKNOWN}:
         return 4
     return 0
 
@@ -201,16 +214,43 @@ def main(
             )
             return 0
 
-        service = _runtime(args.state_root, orchestrator)
+        requires_runtime = args.command == "publish" or (
+            args.command == "campaign" and args.campaign_command == "build"
+        )
+        service = _runtime(
+            args.state_root,
+            orchestrator,
+            require_configuration=requires_runtime,
+        )
         if args.command == "campaign" and args.campaign_command == "build":
+            if service.builder is None:
+                runtime_path = args.state_root / "config" / "runtime.json"
+                raise RuntimeConfigurationError(
+                    f"Creative runtime configuration is missing in {runtime_path}.",
+                    "Add the creative image and narration provider configuration before building a campaign.",
+                )
             campaign = load_campaign(args.campaign)
             result = service.run_campaign(campaign, live=not args.dry_run)
+            statuses = {item.status for item in result.platforms.values()}
+            has_failed = bool(
+                statuses.intersection(
+                    {PublishStatus.FAILED, PublishStatus.UNKNOWN}
+                )
+            )
+            has_blocked = PublishStatus.BLOCKED in statuses
             payload = {
                 "ok": all(
-                    item.status not in {PublishStatus.BLOCKED, PublishStatus.FAILED}
+                    item.status
+                    not in {
+                        PublishStatus.BLOCKED,
+                        PublishStatus.FAILED,
+                        PublishStatus.UNKNOWN,
+                    }
                     for item in result.platforms.values()
                 ),
-                "status": "built",
+                "status": (
+                    "failed" if has_failed else "blocked" if has_blocked else "built"
+                ),
                 "live_success_count": result.live_success_count,
                 "build_manifest": result.build_manifest,
                 "platforms": {
@@ -219,10 +259,9 @@ def main(
                 },
             }
             _emit(payload, output_format)
-            statuses = {item.status for item in result.platforms.values()}
-            if PublishStatus.FAILED in statuses:
+            if has_failed:
                 return 4
-            if PublishStatus.BLOCKED in statuses:
+            if has_blocked:
                 return 3
             return 0
 
@@ -288,6 +327,17 @@ def main(
             return 0
 
         raise ValueError("unsupported command")
+    except RuntimeConfigurationError as exc:
+        _emit(
+            _failure(
+                status="invalid",
+                category="configuration",
+                detail=exc.detail,
+                next_action=exc.next_action,
+            ),
+            output_format,
+        )
+        return 2
     except (ValidationError, json.JSONDecodeError, OSError, ValueError) as exc:
         if isinstance(exc, OSError):
             detail = "The requested file could not be read."

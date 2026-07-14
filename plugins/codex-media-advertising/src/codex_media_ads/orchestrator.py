@@ -27,6 +27,7 @@ from .publishing.base import (
     probe_identity,
     redact_diagnostic,
 )
+from .publishing.router import RouteUnavailableError
 from .queueing import QueueClaim, QueueStore, idempotency_key, retry_decision
 
 
@@ -113,6 +114,11 @@ class PauseStore:
             values = self._read()
             values.discard(self._key(platform, account_id))
             self._write(values)
+        self.receipts.resume(platform, account_id)
+
+    def clear_failures(self, platform: str, account_id: str) -> None:
+        """Reset receipt-derived failures without changing an explicit pause."""
+
         self.receipts.resume(platform, account_id)
 
 
@@ -266,6 +272,7 @@ class Orchestrator:
         if latest is not None and latest.get("status") in {
             PublishStatus.FAILED.value,
             PublishStatus.BLOCKED.value,
+            PublishStatus.UNKNOWN.value,
         }:
             attempt = self._attempt_count(key)
             decision = retry_decision(
@@ -273,6 +280,13 @@ class Orchestrator:
             )
             if not decision.retry:
                 result = self._record_result(latest)
+                if result.status == PublishStatus.UNKNOWN:
+                    result = result.model_copy(
+                        update={
+                            "status": PublishStatus.FAILED,
+                            "error_category": ErrorCategory.AMBIGUOUS_SUBMIT.value,
+                        }
+                    )
                 return result.model_copy(
                     update={
                         "evidence": {
@@ -297,6 +311,12 @@ class Orchestrator:
             if not pending_path.is_file() or claim_path.exists():
                 return None
             value = json.loads(pending_path.read_text())
+            current_request = PublishRequest.model_validate(value["request"])
+            expected_request = request.model_copy(
+                update={"idempotency_key": key}
+            )
+            if current_request != expected_request:
+                return None
             claimed_at = self.queue_store._clock()
             if claimed_at.tzinfo is None:
                 raise ValueError("queue clock must return a timezone-aware datetime")
@@ -394,6 +414,15 @@ class Orchestrator:
         claim = self._set_claim_request(claim, request)
         try:
             adapter = self.router.select(request.account, request.platform)
+        except (RouteUnavailableError, KeyError, ValueError) as exc:
+            return self._terminal(
+                claim,
+                self._gate_result(
+                    category=ErrorCategory.CONFIGURATION.value,
+                    detail=redact_diagnostic(str(exc)),
+                    next_action=f"Configure a publishing route for {request.platform} and probe it again.",
+                ),
+            )
         except Exception:
             return self._terminal(
                 claim,
@@ -499,6 +528,15 @@ class Orchestrator:
                 evidence={"next_action": error.next_action},
             )
 
+        if result.status == PublishStatus.UNKNOWN:
+            result = result.model_copy(
+                update={
+                    "status": PublishStatus.FAILED,
+                    "error_category": ErrorCategory.AMBIGUOUS_SUBMIT.value,
+                    "detail": result.detail
+                    or "The final submit outcome is unknown; reconcile before retrying.",
+                }
+            )
         if result.status in SUCCESS_STATUSES and not self._verified_success(result):
             result = PublishResult(
                 status=PublishStatus.FAILED,
@@ -552,26 +590,54 @@ class Orchestrator:
         return self._process_claim(claim, live=not request.dry_run)
 
     def process_next(self, *, live: bool = True) -> PublishResult:
-        pending = sorted(self.queue_store.pending.glob("*.json"))
-        if not pending:
+        for _restart in range(16):
+            pending = sorted(self.queue_store.pending.glob("*.json"))
+            if not pending:
+                return PublishResult(
+                    status=PublishStatus.SKIPPED,
+                    detail="No queued work is due.",
+                    evidence={"reason": "idle"},
+                )
+
+            first_deferred: PublishResult | None = None
+            selection_changed = False
+            for path in pending:
+                try:
+                    value = json.loads(path.read_text())
+                    queued_request = PublishRequest.model_validate(value["request"])
+                except FileNotFoundError:
+                    selection_changed = True
+                    break
+                effective_request = queued_request.model_copy(
+                    update={"dry_run": queued_request.dry_run or not live}
+                )
+                preclaim = self._preclaim_result(effective_request)
+                if preclaim is not None:
+                    if first_deferred is None:
+                        first_deferred = preclaim
+                    continue
+                claim = self._claim_for(queued_request)
+                if claim is None:
+                    selection_changed = True
+                    break
+                return self._process_claim(claim, live=live)
+
+            if selection_changed:
+                continue
+            if first_deferred is not None:
+                return first_deferred
             return PublishResult(
                 status=PublishStatus.SKIPPED,
-                detail="No queued work is due.",
+                detail="No eligible queued work is due.",
                 evidence={"reason": "idle"},
             )
-        value = json.loads(pending[0].read_text())
-        request = PublishRequest.model_validate(value["request"])
-        request = request.model_copy(update={"dry_run": not live})
-        preclaim = self._preclaim_result(request)
-        if preclaim is not None:
-            return preclaim
-        claim = self.queue_store.claim_next(self.worker_id)
-        if claim is None:
-            return PublishResult(
-                status=PublishStatus.SKIPPED,
-                evidence={"reason": "idle"},
-            )
-        return self._process_claim(claim, live=live)
+
+        return PublishResult(
+            status=PublishStatus.BLOCKED,
+            error_category="queue_changed",
+            detail="The queue changed repeatedly while selecting work.",
+            evidence={"next_action": "Retry publish next after active workers settle."},
+        )
 
     def probe(self, platform: str) -> ProbeResult:
         account = self.accounts.get(platform)
@@ -585,6 +651,13 @@ class Orchestrator:
         try:
             adapter = self.router.select(account, platform)
             probe = adapter.probe_auth(account)
+        except (RouteUnavailableError, KeyError, ValueError) as exc:
+            return ProbeResult(
+                authenticated=False,
+                error_category=ErrorCategory.CONFIGURATION,
+                detail=redact_diagnostic(str(exc)),
+                next_action=f"Configure a publishing route for {platform} and probe it again.",
+            )
         except Exception:
             return ProbeResult(
                 authenticated=False,
@@ -596,6 +669,7 @@ class Orchestrator:
             return probe
         identity = probe_identity(account.expected_identity, probe.observed_identity)
         if identity.ok:
+            self.pause_store.clear_failures(platform, account.account_id)
             return probe
         return ProbeResult(
             authenticated=False,

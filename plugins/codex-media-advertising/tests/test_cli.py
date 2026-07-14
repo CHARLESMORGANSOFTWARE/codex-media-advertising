@@ -6,13 +6,110 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from codex_media_ads import cli
-from codex_media_ads.models import CampaignManifest, PublishStatus
+from codex_media_ads.creative.pipeline import CreativePipeline
+from codex_media_ads.creative.providers import CodimageProvider, CommandNarrationProvider
+from codex_media_ads.models import (
+    CampaignManifest,
+    PublishRequest,
+    PublishResult,
+    PublishStatus,
+)
 
 from test_orchestrator import PLATFORMS, orchestrator, x_request
+
+
+class RuntimeResponse:
+    status_code = 200
+    headers: dict[str, str] = {}
+    text = ""
+
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
+
+    def json(self) -> dict[str, object]:
+        return self.payload
+
+
+class RuntimeTransport:
+    def __init__(self, responses: int = 4) -> None:
+        self.responses = responses
+        self.calls: list[tuple[str, str]] = []
+
+    def request(self, method: str, url: str, **_kwargs) -> RuntimeResponse:
+        self.calls.append((method, url))
+        if self.responses <= 0:
+            raise AssertionError(f"unexpected runtime request: {method} {url}")
+        self.responses -= 1
+        return RuntimeResponse({"screen_name": "runtime-creator"})
+
+
+def write_runtime_config(
+    state_root: Path,
+    *,
+    python_executable: str,
+    include_creative: bool = False,
+) -> tuple[Path, Path]:
+    config_root = state_root / "config"
+    config_root.mkdir(parents=True, mode=0o700)
+    secret_root = state_root / "secrets"
+    secret_root.mkdir(parents=True, mode=0o700)
+    secret_file = secret_root / "x.json"
+    secret_file.write_text(
+        json.dumps(
+            {
+                "consumer_key": "fake-consumer-key",
+                "consumer_secret": "fake-consumer-secret",
+                "access_token": "fake-access-token",
+                "access_token_secret": "fake-access-secret",
+            }
+        )
+    )
+    secret_file.chmod(0o600)
+    config: dict[str, object] = {
+        "accounts": {
+            "x": {
+                "account_id": "runtime-x",
+                "expected_identity": "runtime-creator",
+                "mode": "api",
+                "secret_file": str(secret_file),
+            }
+        }
+    }
+    if include_creative:
+        fixtures = Path(__file__).parent / "fixtures"
+        config["creative"] = {
+            "image": {
+                "provider": "codimage",
+                "project_root": str(state_root / "codimage-project"),
+                "executable_prefix": [
+                    python_executable,
+                    str(fixtures / "fake_codimage.py"),
+                ],
+            },
+            "narration": {
+                "provider": "command",
+                "command_template": [
+                    python_executable,
+                    str(fixtures / "fake_tts.py"),
+                    "--text-file",
+                    "{text_file}",
+                    "--output-path",
+                    "{output_path}",
+                    "--voice",
+                    "{voice}",
+                ],
+                "work_dir": str(state_root / "narration-work"),
+            },
+        }
+    runtime_file = config_root / "runtime.json"
+    runtime_file.write_text(json.dumps(config))
+    runtime_file.chmod(0o600)
+    return runtime_file, secret_file
 
 
 def write_campaign(path: Path) -> Path:
@@ -233,3 +330,249 @@ def test_publish_next_dry_run_marks_the_attempt_receipt(
     receipt = orchestrator.receipts()[-1]
     assert receipt["dry_run"] is True
     assert receipt["status"] == "skipped"
+
+
+def test_publish_next_unknown_is_failed_exit_four(
+    capsys, orchestrator, x_request
+) -> None:
+    orchestrator.adapters["x"].next_result = PublishResult(
+        status=PublishStatus.UNKNOWN,
+        error_category="ambiguous_submit",
+        detail="final submit outcome is unknown",
+    )
+    request_path = x_request.media_path.with_suffix(".json")
+    request_path.write_text(x_request.model_dump_json())
+    run_cli(capsys, ["queue", "add", str(request_path)], orchestrator)
+
+    exit_code, payload = run_cli(
+        capsys, ["publish", "next"], orchestrator
+    )
+
+    assert exit_code == 4
+    assert payload["ok"] is False
+    assert payload["status"] == "failed"
+    assert payload["error_category"] == "ambiguous_submit"
+
+
+def test_campaign_build_summary_treats_unknown_as_failed(
+    capsys, tmp_path: Path, orchestrator
+) -> None:
+    campaign_path = write_campaign(tmp_path / "campaign.json")
+    campaign = CampaignManifest.model_validate_json(campaign_path.read_text())
+    campaign_path.write_text(
+        campaign.model_copy(update={"destinations": ["x"]}).model_dump_json(
+            exclude_computed_fields=True
+        )
+    )
+    orchestrator.adapters["x"].next_result = PublishResult(
+        status=PublishStatus.UNKNOWN,
+        error_category="ambiguous_submit",
+        detail="final submit outcome is unknown",
+    )
+
+    exit_code, payload = run_cli(
+        capsys, ["campaign", "build", str(campaign_path)], orchestrator
+    )
+
+    assert exit_code == 4
+    assert payload["ok"] is False
+    assert payload["status"] == "failed"
+    assert payload["platforms"]["x"]["ok"] is False
+    assert payload["platforms"]["x"]["status"] == "failed"
+
+
+def test_noninjected_probe_reports_actionable_missing_runtime_config(
+    capsys, tmp_path: Path
+) -> None:
+    state_root = tmp_path / "state"
+
+    exit_code, payload = run_cli(
+        capsys,
+        [
+            "--state-root",
+            str(state_root),
+            "publish",
+            "probe",
+            "--platform",
+            "x",
+        ],
+    )
+
+    assert exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error_category"] == "configuration"
+    assert "runtime.json" in payload["detail"]
+    assert "runtime.json" in payload["next_action"]
+
+
+def test_noninjected_probe_loads_actual_x_adapter_and_router(
+    capsys, tmp_path: Path, monkeypatch
+) -> None:
+    state_root = tmp_path / "state"
+    write_runtime_config(
+        state_root,
+        python_executable=sys.executable,
+    )
+    transport = RuntimeTransport()
+    monkeypatch.setattr(
+        "codex_media_ads.publishing.api_adapters.requests.Session",
+        lambda: transport,
+    )
+
+    exit_code, payload = run_cli(
+        capsys,
+        [
+            "--state-root",
+            str(state_root),
+            "publish",
+            "probe",
+            "--platform",
+            "x",
+        ],
+    )
+
+    assert exit_code == 0
+    assert payload == {"ok": True, "platform": "x", "status": "ready"}
+    assert len(transport.calls) == 2
+    assert all("verify_credentials" in url for _, url in transport.calls)
+
+
+def test_noninjected_publish_next_uses_runtime_route_without_live_submit(
+    capsys, tmp_path: Path, monkeypatch
+) -> None:
+    state_root = tmp_path / "state"
+    _, secret_file = write_runtime_config(
+        state_root,
+        python_executable=sys.executable,
+    )
+    transport = RuntimeTransport()
+    monkeypatch.setattr(
+        "codex_media_ads.publishing.api_adapters.requests.Session",
+        lambda: transport,
+    )
+    media = tmp_path / "video.mp4"
+    media.write_bytes(b"not-real-media")
+    request = PublishRequest(
+        content_id="runtime-content",
+        revision=1,
+        platform="x",
+        account={
+            "account_id": "runtime-x",
+            "expected_identity": "runtime-creator",
+            "mode": "api",
+            "secret_file": secret_file,
+        },
+        media_path=media,
+        metadata={"caption": "dry run"},
+        idempotency_key="",
+    )
+    request_path = tmp_path / "request.json"
+    request_path.write_text(request.model_dump_json())
+    run_cli(
+        capsys,
+        ["--state-root", str(state_root), "queue", "add", str(request_path)],
+    )
+
+    exit_code, payload = run_cli(
+        capsys,
+        ["--state-root", str(state_root), "publish", "next", "--dry-run"],
+    )
+
+    assert exit_code == 0
+    assert payload["status"] == "skipped"
+    assert payload["evidence"]["dry_run"] is True
+    assert len(transport.calls) == 2
+
+
+def test_noninjected_campaign_build_constructs_configured_creative_pipeline(
+    capsys, tmp_path: Path, monkeypatch
+) -> None:
+    state_root = tmp_path / "state"
+    write_runtime_config(
+        state_root,
+        python_executable=sys.executable,
+        include_creative=True,
+    )
+    transport = RuntimeTransport()
+    monkeypatch.setattr(
+        "codex_media_ads.publishing.api_adapters.requests.Session",
+        lambda: transport,
+    )
+
+    def fake_build(self: CreativePipeline, campaign: CampaignManifest):
+        assert isinstance(self.image_provider, CodimageProvider)
+        assert isinstance(self.narration_provider, CommandNarrationProvider)
+        output = state_root / "generated" / campaign.campaign_id / "x.mp4"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"rendered-media")
+        return SimpleNamespace(
+            variant_paths={"x": output},
+            dependency=None,
+            failure=None,
+            manifest_path=output.parent / "build-manifest.json",
+        )
+
+    monkeypatch.setattr(CreativePipeline, "build", fake_build)
+    campaign_path = write_campaign(tmp_path / "campaign.json")
+    campaign = CampaignManifest.model_validate_json(campaign_path.read_text())
+    campaign_path.write_text(
+        campaign.model_copy(update={"destinations": ["x"]}).model_dump_json(
+            exclude_computed_fields=True
+        )
+    )
+
+    exit_code, payload = run_cli(
+        capsys,
+        [
+            "--state-root",
+            str(state_root),
+            "campaign",
+            "build",
+            str(campaign_path),
+            "--dry-run",
+        ],
+    )
+
+    assert exit_code == 0
+    assert payload["ok"] is True
+    assert payload["live_success_count"] == 0
+    assert payload["platforms"]["x"]["status"] == "skipped"
+    assert len(transport.calls) == 2
+
+
+def test_noninjected_probe_reports_configured_but_unavailable_route(
+    capsys, tmp_path: Path
+) -> None:
+    state_root = tmp_path / "state"
+    runtime_file, _ = write_runtime_config(
+        state_root,
+        python_executable=sys.executable,
+    )
+    runtime = json.loads(runtime_file.read_text())
+    runtime["accounts"] = {
+        "tiktok": {
+            "account_id": "runtime-tiktok",
+            "expected_identity": "runtime-creator",
+            "mode": "api",
+        }
+    }
+    runtime_file.write_text(json.dumps(runtime))
+
+    exit_code, payload = run_cli(
+        capsys,
+        [
+            "--state-root",
+            str(state_root),
+            "publish",
+            "probe",
+            "--platform",
+            "tiktok",
+        ],
+    )
+
+    assert exit_code == 3
+    assert payload["ok"] is False
+    assert payload["status"] == "blocked"
+    assert payload["error_category"] == "configuration"
+    assert "api route is not configured" in payload["detail"]
+    assert "Configure" in payload["next_action"]

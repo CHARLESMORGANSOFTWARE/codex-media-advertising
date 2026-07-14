@@ -30,6 +30,7 @@ class FakeAdapter:
         self.publish_calls = 0
         self.probe_calls = 0
         self.validation = ValidationResult(ok=True)
+        self.published_requests: list[PublishRequest] = []
         self.probe = ProbeResult(
             authenticated=True,
             observed_identity=f"{platform}-identity",
@@ -52,6 +53,7 @@ class FakeAdapter:
 
     def publish(self, request: PublishRequest) -> PublishResult:
         self.publish_calls += 1
+        self.published_requests.append(request)
         if self.next_results:
             return self.next_results.pop(0)
         return verified(PublishStatus.PUBLISHED, self.platform)
@@ -418,3 +420,169 @@ def test_daily_cap_uses_the_configured_local_date(tmp_path: Path) -> None:
 
     assert result.status == PublishStatus.SKIPPED
     assert result.evidence["reason"] == "daily_cap"
+
+
+def test_unknown_ambiguous_result_is_terminal_failed_work(
+    orchestrator: Orchestrator, x_request: PublishRequest
+) -> None:
+    orchestrator.adapters["x"].next_results = [
+        PublishResult(
+            status=PublishStatus.UNKNOWN,
+            error_category="ambiguous_submit",
+            detail="final submit outcome is unknown",
+        ),
+        verified(PublishStatus.PUBLISHED, "x"),
+    ]
+
+    first = orchestrator.publish(x_request)
+    second = orchestrator.publish(x_request)
+
+    assert first.status == PublishStatus.FAILED
+    assert first.error_category == "ambiguous_submit"
+    assert second.status == PublishStatus.FAILED
+    assert orchestrator.adapters["x"].publish_calls == 1
+    assert not list(orchestrator.queue_store.pending.glob("*.json"))
+
+
+def _lower_sorting_request(
+    orchestrator: Orchestrator,
+    request: PublishRequest,
+    *,
+    platform: str,
+) -> tuple[PublishRequest, str]:
+    target_key = idempotency_key(
+        request.content_id,
+        request.platform,
+        request.account.account_id,
+        request.revision,
+    )
+    for index in range(2000):
+        candidate = request.model_copy(
+            update={
+                "content_id": f"race-{index}",
+                "platform": platform,
+                "account": orchestrator.accounts[platform],
+            }
+        )
+        candidate_key = idempotency_key(
+            candidate.content_id,
+            candidate.platform,
+            candidate.account.account_id,
+            candidate.revision,
+        )
+        if candidate_key < target_key:
+            return candidate, candidate_key
+    raise AssertionError("could not construct a lower-sorting queue key")
+
+
+def test_process_next_does_not_publish_record_inserted_after_precheck(
+    orchestrator: Orchestrator, x_request: PublishRequest, monkeypatch
+) -> None:
+    orchestrator.queue_store.enqueue(x_request)
+    inserted, _ = _lower_sorting_request(
+        orchestrator, x_request, platform="instagram"
+    )
+    orchestrator.pause_store.pause(
+        inserted.platform, inserted.account.account_id
+    )
+    original_preclaim = orchestrator._preclaim_result
+    calls = 0
+
+    def insert_during_precheck(request: PublishRequest):
+        nonlocal calls
+        calls += 1
+        result = original_preclaim(request)
+        if calls == 1:
+            orchestrator.queue_store.enqueue(inserted)
+        return result
+
+    monkeypatch.setattr(orchestrator, "_preclaim_result", insert_during_precheck)
+
+    result = orchestrator.process_next(live=True)
+
+    assert result.status == PublishStatus.PUBLISHED
+    assert orchestrator.adapters["x"].publish_calls == 1
+    assert orchestrator.adapters["instagram"].publish_calls == 0
+
+
+def test_paused_first_record_does_not_starve_next_platform(
+    orchestrator: Orchestrator, x_request: PublishRequest
+) -> None:
+    paused, _ = _lower_sorting_request(
+        orchestrator, x_request, platform="instagram"
+    )
+    orchestrator.pause_store.pause(paused.platform, paused.account.account_id)
+    orchestrator.queue_store.enqueue(paused)
+    orchestrator.queue_store.enqueue(x_request)
+
+    result = orchestrator.process_next(live=True)
+
+    assert result.status == PublishStatus.PUBLISHED
+    assert orchestrator.adapters["x"].publish_calls == 1
+    assert orchestrator.adapters["instagram"].publish_calls == 0
+
+
+def test_process_next_rechecks_record_changed_between_precheck_and_claim(
+    orchestrator: Orchestrator, x_request: PublishRequest, monkeypatch
+) -> None:
+    enqueue = orchestrator.queue_store.enqueue(x_request)
+    assert enqueue.path is not None
+    prechecked_captions: list[str] = []
+    original_preclaim = orchestrator._preclaim_result
+    original_claim = orchestrator._claim_for
+    mutated = False
+
+    def record_precheck(request: PublishRequest):
+        prechecked_captions.append(str(request.metadata["caption"]))
+        return original_preclaim(request)
+
+    def mutate_before_claim(request: PublishRequest):
+        nonlocal mutated
+        if not mutated:
+            value = json.loads(enqueue.path.read_text())
+            value["request"]["metadata"]["caption"] = "changed-after-precheck"
+            orchestrator.queue_store._write_json(enqueue.path, value)
+            mutated = True
+        return original_claim(request)
+
+    monkeypatch.setattr(orchestrator, "_preclaim_result", record_precheck)
+    monkeypatch.setattr(orchestrator, "_claim_for", mutate_before_claim)
+
+    result = orchestrator.process_next(live=True)
+
+    assert result.status == PublishStatus.PUBLISHED
+    assert prechecked_captions == ["hello", "changed-after-precheck"]
+    assert orchestrator.adapters["x"].published_requests[0].metadata["caption"] == (
+        "changed-after-precheck"
+    )
+
+
+def test_successful_identity_probe_clears_only_receipt_failure_pause(
+    orchestrator: Orchestrator, x_request: PublishRequest
+) -> None:
+    failures = orchestrator.queue_store.receipts
+    failures.write_attempt(x_request, failed("validation"))
+    failures.write_attempt(
+        x_request.model_copy(update={"revision": 2}), failed("validation")
+    )
+    assert orchestrator.pause_store.is_paused(
+        "x", x_request.account.account_id
+    )
+
+    probe = orchestrator.probe("x")
+
+    assert probe.authenticated is True
+    assert not orchestrator.pause_store.is_paused(
+        "x", x_request.account.account_id
+    )
+
+
+def test_successful_identity_probe_does_not_clear_manual_pause(
+    orchestrator: Orchestrator, x_request: PublishRequest
+) -> None:
+    orchestrator.pause_store.pause("x", x_request.account.account_id)
+
+    probe = orchestrator.probe("x")
+
+    assert probe.authenticated is True
+    assert orchestrator.pause_store.is_paused("x", x_request.account.account_id)
