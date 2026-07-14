@@ -429,11 +429,11 @@ def test_automation_install_is_blocked_until_setup_proves_live_gates(
 
 
 @pytest.mark.parametrize(
-    ("controls_ready", "expected_exit"),
+    ("submit_enabled", "expected_exit"),
     [(True, 0), (False, 3)],
 )
 def test_noninjected_setup_uses_configured_runtime_probe_narration_and_dry_run(
-    capsys, tmp_path: Path, monkeypatch, controls_ready: bool, expected_exit: int
+    capsys, tmp_path: Path, monkeypatch, submit_enabled: bool, expected_exit: int
 ) -> None:
     events: list[str] = []
     account = AccountConfig(
@@ -464,8 +464,12 @@ def test_noninjected_setup_uses_configured_runtime_probe_narration_and_dry_run(
                 evidence={
                     "dry_run": True,
                     "final_action_skipped": True,
-                    "controls_ready": controls_ready,
-                    "controls": {"upload": True, "submit": controls_ready},
+                    "controls_ready": True,
+                    "controls": {"upload": True, "submit": True},
+                    "controls_enabled": {
+                        "upload": True,
+                        "submit": submit_enabled,
+                    },
                 },
             )
 
@@ -538,9 +542,9 @@ def test_noninjected_setup_uses_configured_runtime_probe_narration_and_dry_run(
     payload = json.loads(capsys.readouterr().out)
 
     assert exit_code == expected_exit, (payload, events)
-    assert payload["status"] == ("ready" if controls_ready else "blocked")
+    assert payload["status"] == ("ready" if submit_enabled else "blocked")
     assert payload["checks"]["chrome"]["status"] == "ok"
-    assert payload["channels"]["x"]["background_enabled"] is controls_ready
+    assert payload["channels"]["x"]["background_enabled"] is submit_enabled
     assert {"probe", "narration", "dry-run"}.issubset(events)
     saved = json.loads((tmp_path / "state" / "config" / "setup.json").read_text())
     assert saved["channels"]["x"]["expected_identity"] == "runtime-creator"

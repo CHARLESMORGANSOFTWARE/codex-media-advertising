@@ -148,8 +148,9 @@ def test_setup_browser_channel_requires_affirmative_controls_readiness(
                 evidence={
                     "dry_run": True,
                     "final_action_skipped": True,
-                    "controls_ready": False,
-                    "controls": {"upload": True, "submit": False},
+                    "controls_ready": True,
+                    "controls": {"upload": True, "submit": True},
+                    "controls_enabled": {"upload": True, "submit": False},
                 },
             )
         },

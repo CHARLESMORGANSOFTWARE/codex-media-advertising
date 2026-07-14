@@ -43,6 +43,7 @@ class BrowserPage(Protocol):
     def text(self, locator: Locator) -> str: ...
     def attribute(self, locator: Locator, name: str) -> str: ...
     def is_visible(self, locator: Locator) -> bool: ...
+    def is_enabled(self, locator: Locator) -> bool: ...
     def click(self, locator: Locator) -> None: ...
     def fill(self, locator: Locator, value: str) -> None: ...
     def set_input_files(self, locator: Locator, path: Path) -> None: ...
@@ -113,6 +114,9 @@ class PlaywrightBrowserPage:
 
     def is_visible(self, locator: Locator) -> bool:
         return bool(self._resolve(locator).is_visible())
+
+    def is_enabled(self, locator: Locator) -> bool:
+        return bool(self._resolve(locator).is_enabled())
 
     def click(self, locator: Locator) -> None:
         self._resolve(locator).click()
@@ -682,11 +686,12 @@ class BrowserPublisher:
         if request.dry_run:
             required_controls = ("upload", "submit")
             controls = {purpose: False for purpose in required_controls}
+            controls_enabled = {purpose: False for purpose in required_controls}
             try:
                 for purpose in required_controls:
-                    controls[purpose] = bool(
-                        self.page.is_visible(self._locator(purpose))
-                    )
+                    locator = self._locator(purpose)
+                    controls[purpose] = bool(self.page.is_visible(locator))
+                    controls_enabled[purpose] = bool(self.page.is_enabled(locator))
             except Exception as exc:
                 return PublishResult(
                     status=PublishStatus.FAILED,
@@ -698,10 +703,11 @@ class BrowserPublisher:
                         "media_validated": True,
                         "controls_ready": False,
                         "controls": controls,
+                        "controls_enabled": controls_enabled,
                     },
                     detail=f"browser control readiness check failed: {type(exc).__name__}",
                 )
-            controls_ready = all(controls.values())
+            controls_ready = all(controls.values()) and all(controls_enabled.values())
             if not controls_ready:
                 return PublishResult(
                     status=PublishStatus.BLOCKED,
@@ -713,12 +719,15 @@ class BrowserPublisher:
                         "media_validated": True,
                         "controls_ready": False,
                         "controls": controls,
+                        "controls_enabled": controls_enabled,
                         "next_action": (
                             "Open the configured composer and verify the upload "
                             "and final submit controls."
                         ),
                     },
-                    detail="required browser publishing controls are not ready",
+                    detail=(
+                        "required browser publishing controls are not visible and enabled"
+                    ),
                 )
             return PublishResult(
                 status=PublishStatus.SKIPPED,
@@ -729,6 +738,7 @@ class BrowserPublisher:
                     "media_validated": True,
                     "controls_ready": True,
                     "controls": controls,
+                    "controls_enabled": controls_enabled,
                 },
                 detail="dry run completed without uploading or submitting",
             )

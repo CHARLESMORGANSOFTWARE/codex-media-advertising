@@ -367,11 +367,15 @@ class SetupService:
         if not safe or not require_controls:
             return safe
         controls = result.evidence.get("controls")
+        controls_enabled = result.evidence.get("controls_enabled")
         return (
             result.evidence.get("controls_ready") is True
             and isinstance(controls, Mapping)
             and controls.get("upload") is True
             and controls.get("submit") is True
+            and isinstance(controls_enabled, Mapping)
+            and controls_enabled.get("upload") is True
+            and controls_enabled.get("submit") is True
         )
 
     def configure(

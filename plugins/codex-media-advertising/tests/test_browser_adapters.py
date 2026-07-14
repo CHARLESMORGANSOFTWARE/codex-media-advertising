@@ -24,6 +24,7 @@ class FakePage:
         self.values: dict[str, str] = {}
         self.attributes: dict[tuple[str, str], str] = {}
         self.visible: set[str] = set()
+        self.enabled: set[str] = set()
         self.actions: list[tuple[object, ...]] = []
         self.submit_clicked = False
         self.text_by_locator: dict[str, str] = {}
@@ -74,6 +75,9 @@ class FakePage:
         if any(key[0] == locator["value"] for key in self.attributes_by_locator):
             return True
         return purpose in self.visible
+
+    def is_enabled(self, locator: dict[str, str]) -> bool:
+        return locator["purpose"] in self.enabled
 
     def click(self, locator: dict[str, str]) -> None:
         purpose = locator["purpose"]
@@ -600,6 +604,9 @@ def test_playwright_page_connects_over_cdp_and_maps_semantic_locators(
         def is_visible(self) -> bool:
             return True
 
+        def is_enabled(self) -> bool:
+            return True
+
         def set_input_files(self, path: str) -> None:
             calls.append(("files", path))
 
@@ -663,6 +670,9 @@ def test_playwright_page_connects_over_cdp_and_maps_semantic_locators(
 
     page = browser_adapters.PlaywrightBrowserPage.connect("http://127.0.0.1:49222")
     page.goto("https://example.test")
+    assert page.is_enabled(
+        {"kind": "role", "value": "button", "name": "Post", "purpose": "submit"}
+    ) is True
     page.click({"kind": "role", "value": "button", "name": "Post", "purpose": "submit"})
     page.fill({"kind": "label", "value": "Caption", "purpose": "caption"}, "copy")
     page.close()
@@ -753,6 +763,7 @@ def test_missing_media_blocks_before_upload(tmp_path: Path, platform: str) -> No
 def test_dry_run_never_submits_and_returns_evidence(tmp_path: Path, platform: str) -> None:
     page = FakePage()
     page.visible.update({"upload", "submit"})
+    page.enabled.update({"upload", "submit"})
     result = make_publisher(platform, page).publish(
         publish_request(tmp_path, platform, dry_run=True)
     )
@@ -760,6 +771,7 @@ def test_dry_run_never_submits_and_returns_evidence(tmp_path: Path, platform: st
     assert result.evidence["dry_run"] is True
     assert result.evidence["final_action_skipped"] is True
     assert result.evidence["controls_ready"] is True
+    assert result.evidence["controls_enabled"] == {"upload": True, "submit": True}
     assert not page.submit_clicked
     assert not any(action[0] == "upload" for action in page.actions)
 
@@ -770,6 +782,7 @@ def test_dry_run_blocks_when_required_publish_control_is_not_visible(
 ) -> None:
     page = FakePage()
     page.visible.update({"upload", "submit"} - {missing})
+    page.enabled.update({"upload", "submit"})
 
     result = make_publisher(platform, page).publish(
         publish_request(tmp_path, platform, dry_run=True)
@@ -780,6 +793,28 @@ def test_dry_run_blocks_when_required_publish_control_is_not_visible(
     assert result.evidence["controls"][missing] is False
     assert result.evidence["controls_ready"] is False
     assert result.evidence.get("final_action_skipped") is not True
+    assert not any(action[0] == "upload" for action in page.actions)
+
+
+@pytest.mark.parametrize("disabled", ["upload", "submit"])
+def test_dry_run_blocks_when_required_publish_control_is_disabled(
+    tmp_path: Path, platform: str, disabled: str
+) -> None:
+    page = FakePage()
+    page.visible.update({"upload", "submit"})
+    page.enabled.update({"upload", "submit"} - {disabled})
+
+    result = make_publisher(platform, page).publish(
+        publish_request(tmp_path, platform, dry_run=True)
+    )
+
+    assert result.status == PublishStatus.BLOCKED
+    assert result.error_category == ErrorCategory.PLATFORM_UI
+    assert result.evidence["controls"] == {"upload": True, "submit": True}
+    assert result.evidence["controls_enabled"][disabled] is False
+    assert result.evidence["controls_ready"] is False
+    assert result.evidence.get("final_action_skipped") is not True
+    assert not page.submit_clicked
     assert not any(action[0] == "upload" for action in page.actions)
 
 

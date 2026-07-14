@@ -98,3 +98,33 @@ Implemented rerunnable setup checks, private secret import, conservative backgro
 - Temporary-HOME `..` and symlink overlap smokes each exited `2`, preserved the
   install sentinel, and did not invoke `launchctl`.
 - CLI help, `compileall -q`, `sh -n`, and `git diff --check` passed.
+
+## Final operability remediation
+
+### RED evidence
+
+- The focused actionable-control regression started at `21 failed, 13 passed`:
+  one missing Playwright enabled-state contract, six missing enabled-evidence
+  cases, twelve disabled upload/submit cases across all six platforms, one
+  direct setup gate, and one non-injected production setup gate.
+
+### Remediations
+
+- `BrowserPage` and its Playwright implementation now expose an enabled-state
+  check backed by the resolved locator's `is_enabled()` operation.
+- Browser dry-runs require both upload and submit controls to be visible and
+  enabled. Evidence includes explicit per-control `controls` visibility and
+  `controls_enabled` state. A disabled control blocks without uploading or
+  clicking the final action.
+- Browser-mode setup validates both per-control evidence maps independently;
+  an inconsistent `controls_ready=true` claim cannot enable background work
+  when either enabled flag is absent or false.
+
+### Verification
+
+- Focused actionable-control slice: `34 passed`.
+- Browser/setup/CLI/LaunchAgent regression: `277 passed`.
+- Final fresh full plugin suite: `521 passed in 1.90s`.
+- Temporary-HOME install and uninstall dry-runs passed without mutation or
+  `launchctl` invocation.
+- `compileall -q`, `sh -n`, and `git diff --check` passed.
