@@ -132,6 +132,8 @@ def test_adapter_exceptions_are_stable_and_redacted(exception: Exception, expect
         '{"cookies":[{"name":"sid","value":"jar-secret"}],"safe":true}',
         '[{"name":"sid","value":"top-level-jar-secret","domain":".example.com"}]',
         '{"name":"sessionid","value":"object-cookie-secret","path":"/"}',
+        '[{"name":"consent","value":"domain-cookie-secret","domain":".example.com","path":"/"}]',
+        '{"name":"csrf_token","value":"delimited-cookie-secret","path":"/"}',
     ],
 )
 def test_adapter_redaction_covers_headers_json_and_oauth_tokens(detail: str) -> None:
@@ -148,6 +150,8 @@ def test_adapter_redaction_covers_headers_json_and_oauth_tokens(detail: str) -> 
     assert "jar-secret" not in result.detail
     assert "top-level-jar-secret" not in result.detail
     assert "object-cookie-secret" not in result.detail
+    assert "domain-cookie-secret" not in result.detail
+    assert "delimited-cookie-secret" not in result.detail
 
 
 def test_redaction_preserves_generic_name_value_json_objects() -> None:
@@ -155,3 +159,27 @@ def test_redaction_preserves_generic_name_value_json_objects() -> None:
         RuntimeError('{"name":"campaign_color","value":"ocean-blue"}')
     )
     assert "ocean-blue" in result.detail
+
+
+@pytest.mark.parametrize(
+    ("detail", "preserved"),
+    [
+        (
+            '{"name":"hero","value":"/assets/hero.png","path":"/campaign"}',
+            "/assets/hero.png",
+        ),
+        (
+            '{"name":"author","value":"Charles","path":"/byline"}',
+            "Charles",
+        ),
+        (
+            '{"name":"tokenizer","value":"wordpiece","path":"/models"}',
+            "wordpiece",
+        ),
+    ],
+)
+def test_redaction_preserves_asset_and_false_positive_name_value_path_records(
+    detail: str, preserved: str
+) -> None:
+    result = normalize_adapter_error(RuntimeError(detail))
+    assert preserved in result.detail

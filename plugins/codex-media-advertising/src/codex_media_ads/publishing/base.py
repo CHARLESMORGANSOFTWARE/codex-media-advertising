@@ -264,7 +264,6 @@ def _looks_like_cookie_record(value: dict[object, object]) -> bool:
     if "name" not in normalized or "value" not in normalized:
         return False
     cookie_attributes = {
-        "path",
         "expires",
         "expiry",
         "http_only",
@@ -279,13 +278,32 @@ def _looks_like_cookie_record(value: dict[object, object]) -> bool:
     if cookie_attributes.intersection(normalized):
         return True
     domain = normalized.get("domain")
-    if "domain" in normalized and isinstance(domain, str):
+    if "path" in normalized and isinstance(domain, str):
         return True
-    name = str(normalized["name"]).casefold()
+    raw_name = str(normalized["name"])
+    delimiter_name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", raw_name)
+    name = delimiter_name.casefold()
+    segments = set(re.findall(r"[a-z0-9]+", name))
     return (
-        name in {"sid", "session", "sessionid", "phpsessid", "jsessionid"}
+        name
+        in {
+            "sid",
+            "session",
+            "sessionid",
+            "phpsessid",
+            "jsessionid",
+            "csrftoken",
+            "xsrftoken",
+            "authtoken",
+            "authorization",
+            "authentication",
+        }
         or name.startswith(("__host-", "__secure-", "_ga", "_gid"))
-        or any(part in name for part in ("session", "csrf", "xsrf", "auth", "token", "cookie"))
+        or bool(
+            segments.intersection(
+                {"sid", "session", "sessionid", "csrf", "xsrf", "auth", "token", "cookie"}
+            )
+        )
     )
 
 
