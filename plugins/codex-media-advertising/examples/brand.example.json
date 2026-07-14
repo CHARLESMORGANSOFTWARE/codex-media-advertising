@@ -1,0 +1,9 @@
+{
+  "schema_version": "1",
+  "brand": "Example Studio",
+  "voice": "Clear, practical, and encouraging",
+  "audience": "Independent creators",
+  "required_claims": [],
+  "prohibited_claims": [],
+  "destination_url": "https://example.com"
+}

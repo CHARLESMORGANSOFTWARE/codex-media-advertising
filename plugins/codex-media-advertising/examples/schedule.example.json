@@ -1,0 +1,11 @@
+{
+  "schema_version": "1",
+  "timezone": "America/Los_Angeles",
+  "schedule": [
+    "2026-08-01T09:00:00-07:00",
+    "2026-08-02T09:00:00-07:00"
+  ],
+  "daily_cap": 2,
+  "retry_limit": 1,
+  "failure_pause_threshold": 2
+}

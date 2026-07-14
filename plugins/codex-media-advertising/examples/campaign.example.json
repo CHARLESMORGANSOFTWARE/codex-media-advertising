@@ -1,0 +1,35 @@
+{
+  "schema_version": "1",
+  "brand": "Example Studio",
+  "campaign_id": "creator-launch",
+  "rights_confirmed": true,
+  "audience": "Independent creators launching their first campaign",
+  "offer": "A practical campaign planning guide",
+  "proof_points": [
+    "Reusable planning templates",
+    "Platform-specific publishing checklists"
+  ],
+  "calls_to_action": [
+    "Read the guide"
+  ],
+  "visual_prompts": [
+    "A creator planning a campaign at a bright, organized desk; no text"
+  ],
+  "narration": "Plan once, adapt thoughtfully, and publish with confidence.",
+  "duration_seconds": 30,
+  "destinations": [
+    "instagram",
+    "tiktok",
+    "youtube",
+    "x",
+    "facebook",
+    "threads"
+  ],
+  "timezone": "America/Los_Angeles",
+  "schedule": [
+    "2026-08-01T09:00:00-07:00"
+  ],
+  "daily_cap": 2,
+  "retry_limit": 1,
+  "failure_pause_threshold": 2
+}
