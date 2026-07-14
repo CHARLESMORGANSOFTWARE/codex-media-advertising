@@ -1,0 +1,467 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from codex_media_ads.models import AccountConfig, PublishRequest
+
+
+class FakeResponse:
+    def __init__(
+        self,
+        payload: object = None,
+        *,
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+        text: str = "",
+    ) -> None:
+        self._payload = {} if payload is None else payload
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.text = text
+
+    def json(self) -> object:
+        return self._payload
+
+
+class EmptyResponse(FakeResponse):
+    def json(self) -> object:
+        raise ValueError("no response body")
+
+
+class QueueTransport:
+    def __init__(self, responses: list[FakeResponse | BaseException]) -> None:
+        self.responses = list(responses)
+        self.calls: list[tuple[str, str, dict[str, object]]] = []
+
+    def request(self, method: str, url: str, **kwargs: object) -> FakeResponse:
+        self.calls.append((method, url, kwargs))
+        if not self.responses:
+            raise AssertionError(f"unexpected request: {method} {url}")
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+
+def _secret_file(tmp_path: Path, **overrides: object) -> Path:
+    data: dict[str, object] = {
+        "access_token": "top-secret-token",
+        "api_version": "v23.0",
+        "destination_ids": {
+            "instagram": "ig-destination-1",
+            "facebook": "fb-destination-1",
+        },
+        "scopes": ["https://www.googleapis.com/auth/youtube.upload"],
+    }
+    data.update(overrides)
+    path = tmp_path / "credentials.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
+def _request(
+    tmp_path: Path,
+    *,
+    platform: str,
+    secret_file: Path | None = None,
+    metadata: dict[str, object] | None = None,
+    dry_run: bool = False,
+) -> PublishRequest:
+    media = tmp_path / "video.mp4"
+    media.write_bytes(b"abcdefghij")
+    account = AccountConfig(
+        account_id="local-account",
+        expected_identity="expected-account",
+        mode="api",
+        secret_file=secret_file or _secret_file(tmp_path),
+    )
+    return PublishRequest(
+        content_id="content-1",
+        revision=1,
+        platform=platform,
+        account=account,
+        media_path=media,
+        metadata=metadata or {"caption": "A caption", "title": "A title"},
+        idempotency_key="attempt-1",
+        dry_run=dry_run,
+    )
+
+
+def test_meta_returns_published_only_after_permalink(tmp_path: Path) -> None:
+    from codex_media_ads.publishing.api_adapters import MetaPublisher
+
+    transport = QueueTransport(
+        [
+            FakeResponse({"id": "ig-destination-1", "username": "expected-account"}),
+            FakeResponse({"id": "creation-1"}),
+            FakeResponse({"success": True}),
+            FakeResponse({"status_code": "FINISHED"}),
+            FakeResponse({"id": "media-1"}),
+            FakeResponse({"permalink": "https://social.example/reel/media-1"}),
+        ]
+    )
+    adapter = MetaPublisher("instagram", transport, sleep=lambda _seconds: None)
+
+    result = adapter.publish(_request(tmp_path, platform="instagram"))
+
+    assert result.status == "published"
+    assert result.platform_id == "media-1"
+    assert result.post_url.endswith("media-1")
+    assert result.evidence["creation_id"] == "creation-1"
+
+
+def test_meta_keeps_confirmed_publish_when_permalink_lookup_fails(
+    tmp_path: Path,
+) -> None:
+    from codex_media_ads.publishing.api_adapters import MetaPublisher
+
+    transport = QueueTransport(
+        [
+            FakeResponse({"id": "ig-destination-1", "username": "expected-account"}),
+            FakeResponse({"id": "creation-1"}),
+            FakeResponse({"success": True}),
+            FakeResponse({"status_code": "FINISHED"}),
+            FakeResponse({"id": "media-1"}),
+            FakeResponse(status_code=503, text="temporarily unavailable"),
+        ]
+    )
+
+    result = MetaPublisher("instagram", transport, sleep=lambda _seconds: None).publish(
+        _request(tmp_path, platform="instagram")
+    )
+
+    assert result.status == "published"
+    assert result.platform_id == "media-1"
+    assert result.post_url == ""
+    assert result.evidence["permalink_lookup"] == "unavailable"
+
+
+def test_meta_uses_separate_facebook_destination_and_finish_contract(
+    tmp_path: Path,
+) -> None:
+    from codex_media_ads.publishing.api_adapters import MetaPublisher
+
+    transport = QueueTransport(
+        [
+            FakeResponse({"id": "fb-destination-1", "name": "expected-account"}),
+            FakeResponse(
+                {
+                    "video_id": "video-1",
+                    "upload_url": "https://rupload.facebook.com/video-upload/v23.0/video-1",
+                }
+            ),
+            FakeResponse({"success": True}),
+            FakeResponse({"status": {"video_status": "ready"}}),
+            FakeResponse({"success": True, "id": "video-1"}),
+            FakeResponse({"permalink_url": "https://facebook.example/reel/video-1"}),
+        ]
+    )
+    adapter = MetaPublisher("facebook", transport, sleep=lambda _seconds: None)
+
+    result = adapter.publish(_request(tmp_path, platform="facebook"))
+
+    assert result.status == "published"
+    assert result.platform_id == "video-1"
+    start = transport.calls[1]
+    finish = transport.calls[4]
+    assert "/fb-destination-1/video_reels" in start[1]
+    assert start[2]["data"] == {"upload_phase": "start"}
+    assert finish[2]["data"]["video_state"] == "PUBLISHED"
+
+
+def test_youtube_reports_requested_and_actual_upload_evidence(tmp_path: Path) -> None:
+    from codex_media_ads.publishing.api_adapters import YouTubePublisher
+
+    transport = QueueTransport(
+        [
+            FakeResponse(
+                {
+                    "items": [
+                        {
+                            "id": "channel-1",
+                            "snippet": {"title": "expected-account"},
+                        }
+                    ]
+                }
+            ),
+            FakeResponse(headers={"Location": "https://upload.example/session-1"}),
+            FakeResponse(
+                {
+                    "id": "video-1",
+                    "status": {
+                        "privacyStatus": "private",
+                        "selfDeclaredMadeForKids": False,
+                        "containsSyntheticMedia": True,
+                        "publishAt": "2030-01-02T03:04:05Z",
+                    },
+                }
+            ),
+        ]
+    )
+    request = _request(
+        tmp_path,
+        platform="youtube",
+        metadata={
+            "title": "A title",
+            "description": "A description",
+            "visibility": "public",
+            "made_for_kids": False,
+            "contains_synthetic_media": True,
+            "publish_at": "2030-01-02T03:04:05Z",
+        },
+    )
+
+    result = YouTubePublisher(transport).publish(request)
+
+    assert result.status == "submitted"
+    assert result.platform_id == "video-1"
+    assert result.evidence == {
+        "requested_visibility": "public",
+        "actual_visibility": "private",
+        "requested_made_for_kids": False,
+        "actual_made_for_kids": False,
+        "requested_contains_synthetic_media": True,
+        "actual_contains_synthetic_media": True,
+        "requested_publish_at": "2030-01-02T03:04:05Z",
+        "actual_publish_at": "2030-01-02T03:04:05Z",
+        "upload_scope": "https://www.googleapis.com/auth/youtube.upload",
+    }
+    initiation = transport.calls[1]
+    body = initiation[2]["json"]
+    assert initiation[2]["params"] == {
+        "uploadType": "resumable",
+        "part": "snippet,status",
+    }
+    assert body["status"] == {
+        "privacyStatus": "private",
+        "selfDeclaredMadeForKids": False,
+        "containsSyntheticMedia": True,
+        "publishAt": "2030-01-02T03:04:05Z",
+    }
+
+
+def test_x_uploads_chunks_polls_and_creates_post_with_disclosures(
+    tmp_path: Path,
+) -> None:
+    from codex_media_ads.publishing.api_adapters import XPublisher
+
+    transport = QueueTransport(
+        [
+            FakeResponse(
+                {"data": {"id": "user-1", "username": "expected-account"}}
+            ),
+            FakeResponse({"data": {"id": "media-1"}}),
+            FakeResponse({}),
+            FakeResponse({}),
+            FakeResponse({}),
+            FakeResponse(
+                {
+                    "data": {
+                        "id": "media-1",
+                        "processing_info": {"state": "pending", "check_after_secs": 0},
+                    }
+                }
+            ),
+            FakeResponse(
+                {
+                    "data": {
+                        "id": "media-1",
+                        "processing_info": {"state": "succeeded"},
+                    }
+                }
+            ),
+            FakeResponse({"data": {"id": "post-1", "text": "A caption"}}),
+        ]
+    )
+    request = _request(
+        tmp_path,
+        platform="x",
+        metadata={
+            "caption": "A caption",
+            "made_with_ai": True,
+            "paid_partnership": True,
+        },
+    )
+    adapter = XPublisher(
+        transport,
+        chunk_size=4,
+        sleep=lambda _seconds: None,
+    )
+
+    result = adapter.publish(request)
+
+    assert result.status == "published"
+    assert result.platform_id == "post-1"
+    append_calls = [
+        call for call in transport.calls if call[2].get("data", {}).get("command") == "APPEND"
+    ]
+    assert [call[2]["data"]["segment_index"] for call in append_calls] == [0, 1, 2]
+    post_body = transport.calls[-1][2]["json"]
+    assert post_body == {
+        "text": "A caption",
+        "media": {"media_ids": ["media-1"]},
+        "made_with_ai": True,
+        "paid_partnership": True,
+    }
+
+
+def test_x_accepts_empty_204_append_responses(tmp_path: Path) -> None:
+    from codex_media_ads.publishing.api_adapters import XPublisher
+
+    transport = QueueTransport(
+        [
+            FakeResponse({"data": {"id": "user-1", "username": "expected-account"}}),
+            FakeResponse({"media_id_string": "media-1"}),
+            EmptyResponse(status_code=204),
+            FakeResponse({"media_id_string": "media-1"}),
+            FakeResponse({"data": {"id": "post-1"}}),
+        ]
+    )
+
+    result = XPublisher(transport, chunk_size=20).publish(
+        _request(tmp_path, platform="x")
+    )
+
+    assert result.status == "published"
+    assert result.platform_id == "post-1"
+
+
+def test_dry_run_probes_identity_but_never_mutates_remote_state(tmp_path: Path) -> None:
+    from codex_media_ads.publishing.api_adapters import XPublisher
+
+    transport = QueueTransport(
+        [
+            FakeResponse(
+                {"data": {"id": "user-1", "username": "expected-account"}}
+            )
+        ]
+    )
+
+    result = XPublisher(transport).publish(
+        _request(tmp_path, platform="x", dry_run=True)
+    )
+
+    assert result.status == "skipped"
+    assert result.evidence["dry_run"] is True
+    assert [method for method, _url, _kwargs in transport.calls] == ["GET"]
+
+
+def test_identity_mismatch_blocks_before_upload(tmp_path: Path) -> None:
+    from codex_media_ads.publishing.api_adapters import MetaPublisher
+
+    transport = QueueTransport(
+        [FakeResponse({"id": "ig-destination-1", "username": "wrong-account"})]
+    )
+
+    result = MetaPublisher("instagram", transport).publish(
+        _request(tmp_path, platform="instagram")
+    )
+
+    assert result.status == "blocked"
+    assert result.error_category == "identity_mismatch"
+    assert [method for method, _url, _kwargs in transport.calls] == ["GET"]
+
+
+def test_unauthorized_identity_probe_blocks_before_upload(tmp_path: Path) -> None:
+    from codex_media_ads.publishing.api_adapters import XPublisher
+
+    transport = QueueTransport(
+        [FakeResponse({"error": "unauthorized"}, status_code=401, text="unauthorized")]
+    )
+
+    result = XPublisher(transport).publish(_request(tmp_path, platform="x"))
+
+    assert result.status == "blocked"
+    assert result.error_category == "authentication"
+    assert result.evidence["upload_started"] is False
+    assert [method for method, _url, _kwargs in transport.calls] == ["GET"]
+
+
+def test_secret_file_must_be_owner_only(tmp_path: Path) -> None:
+    from codex_media_ads.publishing.api_adapters import XPublisher
+
+    secret_file = _secret_file(tmp_path)
+    secret_file.chmod(0o644)
+    transport = QueueTransport([])
+
+    result = XPublisher(transport).publish(
+        _request(tmp_path, platform="x", secret_file=secret_file)
+    )
+
+    assert result.status == "blocked"
+    assert result.error_category == "configuration"
+    assert "owner-only" in result.detail
+    assert transport.calls == []
+
+
+def test_api_errors_redact_tokens_after_upload_has_started(tmp_path: Path) -> None:
+    from codex_media_ads.publishing.api_adapters import XPublisher
+
+    token = "top-secret-token"
+    transport = QueueTransport(
+        [
+            FakeResponse(
+                {"data": {"id": "user-1", "username": "expected-account"}}
+            ),
+            FakeResponse({"data": {"id": "media-1"}}),
+            FakeResponse(
+                {"error": {"access_token": token}},
+                status_code=500,
+                text=f'access_token="{token}"',
+            ),
+        ]
+    )
+
+    result = XPublisher(transport, chunk_size=20).publish(
+        _request(tmp_path, platform="x")
+    )
+
+    assert result.status == "failed"
+    assert result.evidence["upload_started"] is True
+    assert result.evidence["retry_safe"] is False
+    assert token not in result.model_dump_json()
+
+
+def test_processing_polling_is_bounded(tmp_path: Path) -> None:
+    from codex_media_ads.publishing.api_adapters import XPublisher
+
+    pending = FakeResponse(
+        {
+            "data": {
+                "id": "media-1",
+                "processing_info": {"state": "pending", "check_after_secs": 0},
+            }
+        }
+    )
+    transport = QueueTransport(
+        [
+            FakeResponse(
+                {"data": {"id": "user-1", "username": "expected-account"}}
+            ),
+            FakeResponse({"data": {"id": "media-1"}}),
+            FakeResponse({}),
+            FakeResponse({"data": {"id": "media-1", "processing_info": {"state": "pending"}}}),
+            pending,
+            pending,
+        ]
+    )
+
+    result = XPublisher(
+        transport,
+        chunk_size=20,
+        max_poll_attempts=2,
+        sleep=lambda _seconds: None,
+    ).publish(_request(tmp_path, platform="x"))
+
+    assert result.status == "failed"
+    assert result.evidence["upload_started"] is True
+    status_calls = [
+        call
+        for call in transport.calls
+        if call[0] == "GET" and call[2].get("params", {}).get("command") == "STATUS"
+    ]
+    assert len(status_calls) == 2
