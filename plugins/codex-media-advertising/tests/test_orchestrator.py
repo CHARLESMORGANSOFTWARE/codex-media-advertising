@@ -29,6 +29,7 @@ class FakeAdapter:
         self.next_results: list[PublishResult] = []
         self.publish_calls = 0
         self.probe_calls = 0
+        self.probed_accounts: list[AccountConfig] = []
         self.validation = ValidationResult(ok=True)
         self.published_requests: list[PublishRequest] = []
         self.probe = ProbeResult(
@@ -46,6 +47,7 @@ class FakeAdapter:
 
     def probe_auth(self, account: AccountConfig) -> ProbeResult:
         self.probe_calls += 1
+        self.probed_accounts.append(account)
         return self.probe
 
     def validate(self, request: PublishRequest) -> ValidationResult:
@@ -586,3 +588,81 @@ def test_successful_identity_probe_does_not_clear_manual_pause(
 
     assert probe.authenticated is True
     assert orchestrator.pause_store.is_paused("x", x_request.account.account_id)
+
+
+def test_queue_add_canonicalizes_all_account_authority_fields(
+    orchestrator: Orchestrator, x_request: PublishRequest, tmp_path: Path
+) -> None:
+    malicious = x_request.model_copy(
+        update={
+            "account": x_request.account.model_copy(
+                update={
+                    "expected_identity": "attacker-identity",
+                    "mode": "api",
+                    "secret_file": tmp_path / "attacker-secret.json",
+                    "chrome_profile": "Attacker Profile",
+                    "cdp_url": "http://127.0.0.1:65535",
+                }
+            )
+        }
+    )
+
+    enqueue = orchestrator.add_to_queue(malicious)
+
+    assert enqueue.status == "enqueued"
+    queued = PublishRequest.model_validate(
+        json.loads(enqueue.path.read_text())["request"]
+    )
+    assert queued.account == orchestrator.accounts["x"]
+    assert queued.account.secret_file is None
+    assert "attacker" not in enqueue.path.read_text()
+
+
+def test_direct_malicious_queue_record_uses_configured_account_only(
+    orchestrator: Orchestrator, x_request: PublishRequest, tmp_path: Path
+) -> None:
+    malicious = x_request.model_copy(
+        update={
+            "account": x_request.account.model_copy(
+                update={
+                    "expected_identity": "attacker-identity",
+                    "mode": "api",
+                    "secret_file": tmp_path / "attacker-secret.json",
+                    "chrome_profile": "Attacker Profile",
+                }
+            )
+        }
+    )
+    orchestrator.queue_store.enqueue(malicious)
+
+    result = orchestrator.process_next(live=True)
+
+    configured = orchestrator.accounts["x"]
+    assert result.status == PublishStatus.PUBLISHED
+    assert orchestrator.adapters["x"].probed_accounts == [configured]
+    assert orchestrator.adapters["x"].published_requests[0].account == configured
+    completed = next(orchestrator.queue_store.completed.glob("*.json"))
+    stored = json.loads(completed.read_text())
+    assert PublishRequest.model_validate(stored["request"]).account == configured
+
+
+def test_mismatched_queued_account_id_blocks_before_claim_or_adapter(
+    orchestrator: Orchestrator, x_request: PublishRequest
+) -> None:
+    malicious = x_request.model_copy(
+        update={
+            "account": x_request.account.model_copy(
+                update={"account_id": "attacker-account"}
+            )
+        }
+    )
+    orchestrator.queue_store.enqueue(malicious)
+
+    result = orchestrator.process_next(live=True)
+
+    assert result.status == PublishStatus.BLOCKED
+    assert result.error_category == "configuration"
+    assert "account" in result.detail.casefold()
+    assert orchestrator.adapters["x"].probe_calls == 0
+    assert orchestrator.adapters["x"].publish_calls == 0
+    assert not list(orchestrator.queue_store.claims.glob("*.json"))

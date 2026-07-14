@@ -867,6 +867,34 @@ def test_secret_file_must_be_owner_only(tmp_path: Path) -> None:
     assert transport.calls == []
 
 
+@pytest.mark.parametrize("symlink_kind", ["leaf", "parent"])
+def test_secret_reader_rejects_leaf_and_parent_symlinks_before_transport(
+    tmp_path: Path, symlink_kind: str
+) -> None:
+    from codex_media_ads.publishing.api_adapters import XPublisher
+
+    target_root = tmp_path / "target"
+    target_root.mkdir()
+    target = _secret_file(target_root)
+    if symlink_kind == "leaf":
+        configured = tmp_path / "linked-secret.json"
+        configured.symlink_to(target)
+    else:
+        linked_parent = tmp_path / "linked-parent"
+        linked_parent.symlink_to(target_root, target_is_directory=True)
+        configured = linked_parent / target.name
+    transport = QueueTransport([])
+
+    result = XPublisher(transport).publish(
+        _request(tmp_path, platform="x", secret_file=configured)
+    )
+
+    assert result.status == "blocked"
+    assert result.error_category == "configuration"
+    assert "symlink" in result.detail
+    assert transport.calls == []
+
+
 def test_api_errors_redact_tokens_after_upload_has_started(tmp_path: Path) -> None:
     from codex_media_ads.publishing.api_adapters import XPublisher
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import stat
 from pathlib import Path
 from typing import Literal
 
@@ -121,6 +122,66 @@ def _resolve(path: Path | None, base: Path) -> Path | None:
     return path.resolve()
 
 
+def _absolute_without_resolving(path: Path, base: Path) -> Path:
+    expanded = path.expanduser()
+    if not expanded.is_absolute():
+        expanded = base / expanded
+    return Path(os.path.abspath(os.path.normpath(os.fspath(expanded))))
+
+
+def _secure_secret_path(path: Path, *, base: Path, secrets_root: Path) -> Path:
+    candidate = _absolute_without_resolving(path, base)
+    root = _absolute_without_resolving(secrets_root, secrets_root.parent)
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeConfigurationError(
+            "Configured API secret files must remain inside the private secrets directory.",
+            f"Move the secret file under {root} and update runtime.json.",
+        ) from exc
+    if not relative.parts:
+        raise RuntimeConfigurationError(
+            "The private secrets directory cannot be used as a secret file.",
+            f"Configure an owner-only regular JSON file under {root}.",
+        )
+
+    current = root
+    components = (root, *(root / Path(*relative.parts[:index]) for index in range(1, len(relative.parts) + 1)))
+    for index, current in enumerate(components):
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise RuntimeConfigurationError(
+                f"Cannot access the configured API secret path component: {current}",
+                "Create the private secret path with owner-only permissions and retry.",
+            ) from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise RuntimeConfigurationError(
+                f"Configured API secret paths cannot contain symlinks: {current}",
+                "Replace the symlink with an owner-only regular directory or file inside the private secrets directory.",
+            )
+        is_leaf = index == len(components) - 1
+        expected_type = stat.S_ISREG if is_leaf else stat.S_ISDIR
+        if not expected_type(info.st_mode):
+            kind = "file" if is_leaf else "directory"
+            raise RuntimeConfigurationError(
+                f"Configured API secret path component is not a regular {kind}: {current}",
+                "Repair the private secret path and retry.",
+            )
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            expected_mode = "0600" if is_leaf else "0700"
+            raise RuntimeConfigurationError(
+                f"Configured API secret path components must be owner-only: {current}",
+                f"Set mode {expected_mode} on {current} and retry.",
+            )
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise RuntimeConfigurationError(
+                f"Configured API secret path components must be owned by the current user: {current}",
+                "Correct the secret path ownership and retry.",
+            )
+    return candidate
+
+
 def _read_runtime_config(path: Path) -> RuntimeConfig:
     if path.is_symlink() or not path.is_file():
         raise RuntimeConfigurationError(
@@ -142,11 +203,21 @@ def _read_runtime_config(path: Path) -> RuntimeConfig:
 
 
 def _resolved_accounts(
-    accounts: dict[str, AccountConfig], config_root: Path
+    accounts: dict[str, AccountConfig], config_root: Path, secrets_root: Path
 ) -> dict[str, AccountConfig]:
     return {
         platform: account.model_copy(
-            update={"secret_file": _resolve(account.secret_file, config_root)}
+            update={
+                "secret_file": (
+                    _secure_secret_path(
+                        account.secret_file,
+                        base=config_root,
+                        secrets_root=secrets_root,
+                    )
+                    if account.secret_file is not None
+                    else None
+                )
+            }
         )
         for platform, account in accounts.items()
     }
@@ -296,7 +367,11 @@ def load_runtime(
 
     config = _read_runtime_config(runtime_path)
     config_root = runtime_path.parent
-    accounts = _resolved_accounts(config.accounts, config_root)
+    accounts = _resolved_accounts(
+        config.accounts,
+        config_root,
+        layout["secrets"],
+    )
 
     from .publishing.api_adapters import MetaPublisher, XPublisher, YouTubePublisher
 

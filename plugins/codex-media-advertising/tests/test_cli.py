@@ -576,3 +576,113 @@ def test_noninjected_probe_reports_configured_but_unavailable_route(
     assert payload["error_category"] == "configuration"
     assert "api route is not configured" in payload["detail"]
     assert "Configure" in payload["next_action"]
+
+
+def _set_runtime_secret(runtime_file: Path, secret_file: Path) -> None:
+    runtime = json.loads(runtime_file.read_text())
+    runtime["accounts"]["x"]["secret_file"] = str(secret_file)
+    runtime_file.write_text(json.dumps(runtime))
+
+
+@pytest.mark.parametrize("symlink_kind", ["leaf", "parent"])
+def test_runtime_rejects_secret_symlink_without_reading_target(
+    capsys, tmp_path: Path, monkeypatch, symlink_kind: str
+) -> None:
+    state_root = tmp_path / "state"
+    runtime_file, _ = write_runtime_config(
+        state_root,
+        python_executable=sys.executable,
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "target.json"
+    target.write_text(
+        json.dumps(
+            {
+                "consumer_key": "fake-consumer-key",
+                "consumer_secret": "fake-consumer-secret",
+                "access_token": "fake-access-token",
+                "access_token_secret": "fake-access-secret",
+            }
+        )
+    )
+    target.chmod(0o600)
+    secrets_root = state_root / "secrets"
+    if symlink_kind == "leaf":
+        configured_path = secrets_root / "linked.json"
+        configured_path.symlink_to(target)
+    else:
+        linked_parent = secrets_root / "linked-parent"
+        linked_parent.symlink_to(outside, target_is_directory=True)
+        configured_path = linked_parent / target.name
+    _set_runtime_secret(runtime_file, configured_path)
+
+    real_read_text = Path.read_text
+    target_reads = 0
+
+    def tracked_read_text(path: Path, *args, **kwargs):
+        nonlocal target_reads
+        if path == target:
+            target_reads += 1
+        return real_read_text(path, *args, **kwargs)
+
+    sessions = 0
+
+    def session_factory():
+        nonlocal sessions
+        sessions += 1
+        return RuntimeTransport()
+
+    monkeypatch.setattr(Path, "read_text", tracked_read_text)
+    monkeypatch.setattr(
+        "codex_media_ads.publishing.api_adapters.requests.Session",
+        session_factory,
+    )
+
+    exit_code, payload = run_cli(
+        capsys,
+        [
+            "--state-root",
+            str(state_root),
+            "publish",
+            "probe",
+            "--platform",
+            "x",
+        ],
+    )
+
+    assert exit_code == 2
+    assert payload["error_category"] == "configuration"
+    assert "symlink" in payload["detail"].casefold()
+    assert target_reads == 0
+    assert sessions == 0
+
+
+def test_runtime_rejects_secret_outside_private_secrets_root(
+    capsys, tmp_path: Path
+) -> None:
+    state_root = tmp_path / "state"
+    runtime_file, _ = write_runtime_config(
+        state_root,
+        python_executable=sys.executable,
+    )
+    outside = tmp_path / "outside-secret.json"
+    outside.write_text('{"access_token":"not-read"}')
+    outside.chmod(0o600)
+    _set_runtime_secret(runtime_file, outside)
+
+    exit_code, payload = run_cli(
+        capsys,
+        [
+            "--state-root",
+            str(state_root),
+            "publish",
+            "probe",
+            "--platform",
+            "x",
+        ],
+    )
+
+    assert exit_code == 2
+    assert payload["error_category"] == "configuration"
+    assert "private secrets" in payload["detail"].casefold()

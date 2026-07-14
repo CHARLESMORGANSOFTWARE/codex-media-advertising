@@ -241,6 +241,30 @@ class Orchestrator:
             >= self.daily_cap
         )
 
+    def _canonical_request(
+        self, request: PublishRequest
+    ) -> tuple[PublishRequest | None, PublishResult | None]:
+        configured = self.accounts.get(request.platform)
+        if configured is None:
+            return None, PublishResult(
+                status=PublishStatus.BLOCKED,
+                error_category=ErrorCategory.CONFIGURATION.value,
+                detail="No configured account is associated with this platform.",
+                evidence={
+                    "next_action": "Configure the platform account before queueing or publishing work."
+                },
+            )
+        if request.account.account_id != configured.account_id:
+            return None, PublishResult(
+                status=PublishStatus.BLOCKED,
+                error_category=ErrorCategory.CONFIGURATION.value,
+                detail="The queued account association does not match the configured platform account.",
+                evidence={
+                    "next_action": "Remove the untrusted queue record and enqueue it for the configured account."
+                },
+            )
+        return request.model_copy(update={"account": configured}), None
+
     def _preclaim_result(self, request: PublishRequest) -> PublishResult | None:
         key = self._key(request)
         success = self.queue_store.receipts.latest_success(key)
@@ -298,6 +322,10 @@ class Orchestrator:
         return None
 
     def add_to_queue(self, request: PublishRequest):
+        request, account_error = self._canonical_request(request)
+        if account_error is not None:
+            return account_error
+        assert request is not None
         preclaim = self._preclaim_result(request)
         if preclaim is not None:
             return preclaim
@@ -408,7 +436,11 @@ class Orchestrator:
         return self.queue_store._claim_from_record(claim_path, value)
 
     def _process_claim(self, claim: QueueClaim, *, live: bool) -> PublishResult:
-        request = claim.request.model_copy(
+        canonical, account_error = self._canonical_request(claim.request)
+        if account_error is not None:
+            return self._terminal(claim, account_error)
+        assert canonical is not None
+        request = canonical.model_copy(
             update={"dry_run": claim.request.dry_run or not live}
         )
         claim = self._set_claim_request(claim, request)
@@ -567,6 +599,10 @@ class Orchestrator:
         return self._terminal(claim, result)
 
     def publish(self, request: PublishRequest) -> PublishResult:
+        request, account_error = self._canonical_request(request)
+        if account_error is not None:
+            return account_error
+        assert request is not None
         preclaim = self._preclaim_result(request)
         if preclaim is not None:
             return preclaim
@@ -608,7 +644,13 @@ class Orchestrator:
                 except FileNotFoundError:
                     selection_changed = True
                     break
-                effective_request = queued_request.model_copy(
+                canonical, account_error = self._canonical_request(queued_request)
+                if account_error is not None:
+                    if first_deferred is None:
+                        first_deferred = account_error
+                    continue
+                assert canonical is not None
+                effective_request = canonical.model_copy(
                     update={"dry_run": queued_request.dry_run or not live}
                 )
                 preclaim = self._preclaim_result(effective_request)

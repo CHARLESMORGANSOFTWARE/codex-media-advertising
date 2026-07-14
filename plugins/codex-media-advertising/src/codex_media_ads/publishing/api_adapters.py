@@ -87,7 +87,29 @@ def _read_secret(account: AccountConfig) -> dict[str, object]:
             "an API secret file is not configured",
             category=ErrorCategory.CONFIGURATION,
         )
-    path = Path(path).expanduser()
+    path = Path(
+        os.path.abspath(
+            os.path.normpath(os.fspath(Path(path).expanduser()))
+        )
+    )
+    for parent in reversed(path.parents):
+        try:
+            parent_info = parent.lstat()
+        except OSError as exc:
+            raise _ApiFailure(
+                f"cannot inspect the configured secret path: {exc}",
+                category=ErrorCategory.CONFIGURATION,
+            ) from exc
+        if stat.S_ISLNK(parent_info.st_mode):
+            raise _ApiFailure(
+                "the API secret path must not contain symlink directories",
+                category=ErrorCategory.CONFIGURATION,
+            )
+        if not stat.S_ISDIR(parent_info.st_mode):
+            raise _ApiFailure(
+                "the API secret path must contain only regular directories",
+                category=ErrorCategory.CONFIGURATION,
+            )
     try:
         info = path.lstat()
     except OSError as exc:
