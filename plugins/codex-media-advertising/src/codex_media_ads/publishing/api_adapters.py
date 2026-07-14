@@ -470,7 +470,11 @@ class MetaPublisher(_PublisherBase):
             if request.dry_run:
                 return PublishResult(
                     status=PublishStatus.SKIPPED,
-                    evidence={"dry_run": True, "observed_identity": probe.observed_identity},
+                    evidence={
+                        "dry_run": True,
+                        "final_action_skipped": True,
+                        "observed_identity": probe.observed_identity,
+                    },
                 )
             upload_started = True
             if self.platform == "instagram":
@@ -735,7 +739,11 @@ class YouTubePublisher(_PublisherBase):
             if request.dry_run:
                 return PublishResult(
                     status=PublishStatus.SKIPPED,
-                    evidence={"dry_run": True, "observed_identity": probe.observed_identity},
+                    evidence={
+                        "dry_run": True,
+                        "final_action_skipped": True,
+                        "observed_identity": probe.observed_identity,
+                    },
                 )
             metadata = request.metadata
             requested_visibility = str(metadata.get("visibility", "private"))
@@ -1164,7 +1172,11 @@ class XPublisher(_PublisherBase):
             if request.dry_run:
                 return PublishResult(
                     status=PublishStatus.SKIPPED,
-                    evidence={"dry_run": True, "observed_identity": probe.observed_identity},
+                    evidence={
+                        "dry_run": True,
+                        "final_action_skipped": True,
+                        "observed_identity": probe.observed_identity,
+                    },
                 )
             media_size = request.media_path.stat().st_size
             if media_size < 1:

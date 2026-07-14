@@ -34,6 +34,7 @@ def _service(tmp_path: Path, **overrides) -> SetupService:
     }
     for path in tools.values():
         path.touch()
+        path.chmod(0o700)
     arguments = {
         "state_root": tmp_path / "state",
         "tool_paths": tools,
@@ -83,6 +84,35 @@ def test_setup_requires_exact_identity_and_final_action_skipping_dry_run(
     assert unsafe.channels["instagram"].background_enabled is False
 
 
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        {"dry_run": True},
+        {"final_action_skipped": True},
+        {"dry_run": True, "final_action_skipped": False},
+    ],
+)
+def test_setup_requires_explicit_dry_run_and_final_action_skipped_evidence(
+    tmp_path: Path, evidence: dict[str, object]
+) -> None:
+    service = _service(
+        tmp_path,
+        dry_runs={
+            "instagram": lambda: PublishResult(
+                status=PublishStatus.SKIPPED,
+                evidence=evidence,
+            )
+        },
+    )
+
+    result = service.configure(
+        enabled=["instagram"],
+        channels={"instagram": {"expected_identity": "creator@example.test"}},
+    )
+
+    assert result.channels["instagram"].background_enabled is False
+
+
 def test_setup_enables_only_after_all_live_job_gates_pass(tmp_path: Path) -> None:
     result = _service(tmp_path).configure(
         enabled=["instagram"],
@@ -121,6 +151,30 @@ def test_checks_report_ok_blocked_and_missing_without_real_subprocesses(
     assert checks["ffprobe"].status == "missing"
     assert checks["narration_provider"].status == "missing"
     assert checks["adapter:instagram"].status == "blocked"
+    assert checks["writable_private_state"].status == "ok"
+
+
+def test_tool_checks_reject_directories_and_non_executable_files(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    service.tool_paths["ffmpeg"] = tmp_path
+    non_executable = tmp_path / "not-executable"
+    non_executable.write_text("tool")
+    non_executable.chmod(0o600)
+    service.tool_paths["ffprobe"] = non_executable
+
+    checks = service.run_checks()
+
+    assert checks["ffmpeg"].status != "ok"
+    assert checks["ffprobe"].status != "ok"
+
+
+def test_writable_state_probe_recovers_from_stale_prior_probe(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    service.state_root.mkdir(parents=True)
+    (service.state_root / ".setup-write-probe").write_text("stale")
+
+    checks = service.run_checks()
+
     assert checks["writable_private_state"].status == "ok"
 
 
@@ -165,6 +219,46 @@ def test_setup_writes_nonsecret_config_and_never_secret_content(tmp_path: Path) 
         )
 
 
+@pytest.mark.parametrize(
+    "key",
+    [
+        "authorization",
+        "bearer",
+        "token",
+        "cookie",
+        "key",
+        "password",
+        "client_secret",
+    ],
+)
+def test_setup_recursively_rejects_secret_like_keys(
+    tmp_path: Path, key: str
+) -> None:
+    with pytest.raises(ValueError, match="secret-bearing"):
+        _service(tmp_path).configure(
+            enabled=["x"],
+            channels={
+                "x": {
+                    "expected_identity": "creator@example.test",
+                    "metadata": {key: "must-not-persist"},
+                }
+            },
+        )
+
+
+def test_setup_rejects_unknown_nonsecret_channel_keys(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unknown"):
+        _service(tmp_path).configure(
+            enabled=["instagram"],
+            channels={
+                "instagram": {
+                    "expected_identity": "creator@example.test",
+                    "nickname": "unexpected",
+                }
+            },
+        )
+
+
 def test_secret_import_rejects_symlinks_and_copies_atomically_private(
     tmp_path: Path,
 ) -> None:
@@ -203,3 +297,20 @@ def test_secret_import_rejects_a_symlinked_source_parent(tmp_path: Path) -> None
 
     with pytest.raises(SecretImportError, match="symlink"):
         _service(tmp_path).import_secret(linked / "credentials.json", "x.json")
+
+
+def test_secret_import_rejects_symlinked_private_destination_root(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    service.state_root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (service.state_root / "secrets").symlink_to(outside, target_is_directory=True)
+    source = tmp_path / "credential.json"
+    source.write_text("private")
+
+    with pytest.raises(SecretImportError, match="symlink"):
+        service.import_secret(source, "x.json")
+
+    assert not (outside / "x.json").exists()

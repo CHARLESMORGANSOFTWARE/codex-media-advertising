@@ -816,6 +816,7 @@ def test_dry_run_probes_identity_but_never_mutates_remote_state(tmp_path: Path) 
 
     assert result.status == "skipped"
     assert result.evidence["dry_run"] is True
+    assert result.evidence["final_action_skipped"] is True
     assert [method for method, _url, _kwargs in transport.calls] == ["GET"]
 
 

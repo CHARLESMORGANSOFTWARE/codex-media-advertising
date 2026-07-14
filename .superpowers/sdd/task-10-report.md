@@ -40,3 +40,28 @@ Implemented rerunnable setup checks, private secret import, conservative backgro
 - `compileall -q` — passed.
 - `sh -n` for both scripts — passed.
 - `git diff --check` — passed.
+
+## Review remediation
+
+### Additional RED evidence
+
+- A focused review regression run produced `27 failed, 7 passed` for the reviewed gaps: permissive dry-run evidence, inert production setup wiring, unsafe schema persistence, destination symlinks, weak same-label plist ownership, unsafe uninstall overrides, stale writable probes, and non-executable tools.
+- Follow-up edge regressions independently failed before fixes for configured nonstandard Chrome discovery, filesystem-root state overlap, and a safe temporary HOME whose ancestor is a system symlink.
+
+### Remediations
+
+- Non-injected `setup --enable` now loads the private runtime, derives exact configured account identity/mode, calls the real orchestrator probe, selects the configured adapter lazily, and passes an actual synthetic-media `dry_run=True` request to that adapter. API and browser adapters now explicitly attest both `dry_run=true` and `final_action_skipped=true`.
+- The configured creative pipeline supplies FFmpeg, ffprobe, Codimage, narration, and nonstandard Chrome paths. Narration is exercised through its configured provider. Browser-only dependencies are reported but become required only for browser/auto channels.
+- Setup configuration accepts only supported channel names and the `expected_identity`/`mode` whitelist. Unknown fields are rejected, and recursive secret-like keys including authorization, bearer, token, cookie, key, password, and client secret are rejected before persistence.
+- Secret destinations are lexically constrained beneath the private state `secrets` directory. Existing parent and leaf components are inspected with `lstat`; symlinks, non-directories, and unsafe leaves are refused before the atomic write.
+- LaunchAgent reinstall, listing, and removal now require the entire deterministic plugin-owned plist structure: label, executable and argument array, working directory, state environment namespace, private log paths, `RunAtLoad=false`, and one valid schedule. Same-label foreign or malformed plists are never booted out, overwritten, or deleted.
+- Uninstall validates overrides before dry-run or mutation. Empty, root, HOME, state, state-overlapping, lexically ambiguous, symlinked plugin subpaths, and non-plugin-named locations are rejected; a trusted HOME with a system symlink ancestor remains safe for temporary-HOME use.
+- Writable-state checks use unique temporary probes and clean them up, so a stale historical probe cannot block reruns. Tool checks require regular executable files.
+
+### Final verification after remediation
+
+- Focused setup/LaunchAgent/CLI suite: `87 passed`.
+- Full plugin suite: `493 passed in 1.48s`.
+- Temporary-HOME install and uninstall dry-runs passed without mutation or `launchctl`.
+- Negative uninstall dry-runs rejected `/`, HOME, state root, and a state descendant with exit `2`.
+- CLI help, `compileall -q`, `sh -n`, and `git diff --check` passed.

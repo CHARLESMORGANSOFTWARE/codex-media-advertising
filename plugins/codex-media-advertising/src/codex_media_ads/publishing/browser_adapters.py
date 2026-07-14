@@ -692,6 +692,7 @@ class BrowserPublisher:
                 status=PublishStatus.SKIPPED,
                 evidence={
                     "dry_run": True,
+                    "final_action_skipped": True,
                     "observed_identity": probe.observed_identity,
                     "media_validated": True,
                     "controls": controls,

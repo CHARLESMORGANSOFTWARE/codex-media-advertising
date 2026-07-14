@@ -757,6 +757,7 @@ def test_dry_run_never_submits_and_returns_evidence(tmp_path: Path, platform: st
     )
     assert result.status == PublishStatus.SKIPPED
     assert result.evidence["dry_run"] is True
+    assert result.evidence["final_action_skipped"] is True
     assert not page.submit_clicked
     assert not any(action[0] == "upload" for action in page.actions)
 

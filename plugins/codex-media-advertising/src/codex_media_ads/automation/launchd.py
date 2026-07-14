@@ -105,6 +105,47 @@ class LaunchdBuilder:
             payload["StartInterval"] = schedule.interval
         return payload
 
+    def owns(
+        self,
+        payload: object,
+        name: str,
+        *,
+        state_root: Path | None = None,
+    ) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        environment = payload.get("EnvironmentVariables")
+        if not isinstance(environment, dict) or set(environment) != {
+            "CODEX_MEDIA_ADS_STATE_ROOT"
+        }:
+            return False
+        configured_root = environment.get("CODEX_MEDIA_ADS_STATE_ROOT")
+        if not isinstance(configured_root, str) or not Path(
+            configured_root
+        ).is_absolute():
+            return False
+        root = (
+            Path(state_root).expanduser().absolute()
+            if state_root is not None
+            else Path(configured_root)
+        )
+        if configured_root != str(root):
+            return False
+        has_calendar = "StartCalendarInterval" in payload
+        has_interval = "StartInterval" in payload
+        if has_calendar == has_interval:
+            return False
+        try:
+            schedule = (
+                Schedule(calendar=payload["StartCalendarInterval"])
+                if has_calendar
+                else Schedule(interval=payload["StartInterval"])
+            )
+            expected = self.build(name, state_root=root, schedule=schedule)
+        except (KeyError, TypeError, ValueError):
+            return False
+        return payload == expected
+
 
 class LaunchdManager:
     def __init__(
@@ -167,7 +208,7 @@ class LaunchdManager:
                 existing = plistlib.loads(path.read_bytes())
             except (OSError, ValueError, plistlib.InvalidFileException):
                 raise ValueError("existing LaunchAgent path is not plugin-owned")
-            if existing.get("Label") != self.builder.label(name):
+            if not self.builder.owns(existing, name, state_root=state_root):
                 raise ValueError("existing LaunchAgent path is not plugin-owned")
             self.run(
                 ["launchctl", "bootout", f"gui/{self.uid}", str(path)],
@@ -201,12 +242,11 @@ class LaunchdManager:
             if not isinstance(label, str) or label != path.stem or not label.startswith(prefix):
                 continue
             name = label.removeprefix(prefix)
-            if _NAME.fullmatch(name):
+            if _NAME.fullmatch(name) and self.builder.owns(payload, name):
                 names.append(name)
         return names
 
     def remove(self, name: str, *, state_root: Path | None = None) -> bool:
-        del state_root  # State preservation is the default and only remove behavior.
         path = self._path(name)
         if not path.is_file() or path.is_symlink():
             return False
@@ -214,7 +254,7 @@ class LaunchdManager:
             payload = plistlib.loads(path.read_bytes())
         except (OSError, ValueError, plistlib.InvalidFileException):
             return False
-        if payload.get("Label") != self.builder.label(name):
+        if not self.builder.owns(payload, name, state_root=state_root):
             return False
         completed = self.run(
             ["launchctl", "bootout", f"gui/{self.uid}", str(path)],

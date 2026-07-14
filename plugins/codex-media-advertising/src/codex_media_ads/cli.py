@@ -156,13 +156,124 @@ def _launchd_manager() -> LaunchdManager:
     )
 
 
+def _configured_tool(value: object) -> Path | None:
+    text = os.fspath(value) if isinstance(value, (str, Path)) else ""
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    if path.is_absolute():
+        return path
+    discovered = shutil.which(text)
+    return Path(discovered) if discovered else None
+
+
+def _setup_dry_run(service: Orchestrator, platform: str, state_root: Path) -> PublishResult:
+    account = service.accounts[platform]
+    adapter = service.router.select(account, platform)
+    request = PublishRequest(
+        content_id="setup-proof",
+        revision=1,
+        platform=platform,
+        account=account,
+        media_path=state_root / "health" / "setup-render.mp4",
+        metadata={
+            "caption": "Codex Media Ads setup proof",
+            "description": "Codex Media Ads setup proof",
+            "title": "Codex Media Ads setup proof",
+        },
+        idempotency_key=f"setup-proof-{platform}",
+        dry_run=True,
+    )
+    return adapter.publish(request)
+
+
+def _configured_setup_service(
+    state_root: Path,
+) -> tuple[SetupService, dict[str, dict[str, object]]]:
+    state_root = Path(state_root).expanduser().absolute()
+    runtime = load_runtime(state_root, require_configuration=True)
+    defaults = {
+        platform: {
+            "expected_identity": account.expected_identity,
+            "mode": account.mode,
+        }
+        for platform, account in runtime.accounts.items()
+    }
+    probes = {
+        platform: (lambda name=platform: runtime.probe(name))
+        for platform in runtime.accounts
+    }
+    dry_runs = {
+        platform: (
+            lambda name=platform: _setup_dry_run(runtime, name, state_root)
+        )
+        for platform in runtime.accounts
+    }
+    tool_paths: dict[str, Path | None] = {}
+    browser_adapters = getattr(runtime.router, "browser_adapters", {})
+    for lazy_adapter in browser_adapters.values():
+        browser = getattr(lazy_adapter, "browser", None)
+        chrome_path = getattr(browser, "chrome_path", None)
+        if chrome_path is None:
+            continue
+        configured_chrome = Path(chrome_path).expanduser()
+        if not configured_chrome.is_absolute():
+            configured_chrome = Path(lazy_adapter.config_root) / configured_chrome
+        tool_paths["chrome"] = configured_chrome.absolute()
+        break
+    narration_probe = None
+    builder = runtime.builder
+    if builder is not None:
+        tool_paths["ffmpeg"] = _configured_tool(builder.ffmpeg)
+        tool_paths["ffprobe"] = _configured_tool(builder.ffprobe)
+        image_command = getattr(builder.image_provider, "command_identity", [])
+        tool_paths["codimage"] = _configured_tool(
+            image_command[0] if image_command else None
+        )
+        narration_command = getattr(
+            builder.narration_provider, "command_identity", []
+        )
+        tool_paths["narration"] = _configured_tool(
+            narration_command[0] if narration_command else None
+        )
+
+        def probe_narration() -> bool:
+            output = state_root / "health" / "setup-narration.wav"
+            output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            output.unlink(missing_ok=True)
+            result = builder.narration_provider.synthesize(
+                "Codex Media Ads setup proof.", output, builder.voice
+            )
+            ready = Path(result).is_file() and Path(result).stat().st_size > 0
+            if ready:
+                Path(result).chmod(0o600)
+            return ready
+
+        narration_probe = probe_narration
+    return (
+        SetupService(
+            state_root,
+            tool_paths=tool_paths,
+            probes=probes,
+            dry_runs=dry_runs,
+            narration_probe=narration_probe,
+        ),
+        defaults,
+    )
+
+
 def _channel_config(path: Path | None) -> dict[str, dict[str, object]]:
     if path is None:
         return {}
     value = json.loads(path.read_text())
     if not isinstance(value, dict):
         raise ValueError("setup configuration must be a JSON object")
-    channels = value.get("channels", value)
+    unknown = set(value) - {"channels"}
+    if unknown:
+        raise ValueError(
+            "unknown setup configuration keys: " + ", ".join(sorted(unknown))
+        )
+    channels = value.get("channels")
     if not isinstance(channels, dict) or any(
         not isinstance(item, dict) for item in channels.values()
     ):
@@ -275,6 +386,8 @@ def main(
     output_format = getattr(args, "format", "json")
     try:
         if args.command == "setup":
+            defaults: dict[str, dict[str, object]] = {}
+            supplied_setup_service = setup_service is not None
             setup_service = setup_service or SetupService(args.state_root)
             imported: list[str] = []
             for specification in args.import_secret:
@@ -283,9 +396,16 @@ def main(
                 name, source = specification.split("=", 1)
                 destination = setup_service.import_secret(Path(source), name)
                 imported.append(str(destination))
+            if args.enable and not supplied_setup_service:
+                setup_service, defaults = _configured_setup_service(args.state_root)
+            supplied_channels = _channel_config(args.config)
+            channels = {
+                name: {**defaults.get(name, {}), **supplied_channels.get(name, {})}
+                for name in set(defaults) | set(supplied_channels)
+            }
             result = setup_service.configure(
                 enabled=args.enable,
-                channels=_channel_config(args.config),
+                channels=channels,
             )
             payload = setup_result_payload(result)
             if imported:

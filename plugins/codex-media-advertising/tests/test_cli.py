@@ -15,6 +15,7 @@ from codex_media_ads.automation.launchd import LaunchdBuilder, LaunchdManager
 from codex_media_ads.creative.pipeline import CreativePipeline
 from codex_media_ads.creative.providers import CodimageProvider, CommandNarrationProvider
 from codex_media_ads.models import (
+    AccountConfig,
     CampaignManifest,
     PublishRequest,
     PublishResult,
@@ -425,6 +426,123 @@ def test_automation_install_is_blocked_until_setup_proves_live_gates(
 
     assert exit_code == 3
     assert payload["status"] == "blocked"
+
+
+def test_noninjected_setup_uses_configured_runtime_probe_narration_and_dry_run(
+    capsys, tmp_path: Path, monkeypatch
+) -> None:
+    events: list[str] = []
+    account = AccountConfig(
+        account_id="runtime-x",
+        expected_identity="runtime-creator",
+        mode="api",
+    )
+
+    class Adapter:
+        def probe_auth(self, supplied):
+            assert supplied is account
+            events.append("probe")
+            return SimpleNamespace(
+                authenticated=True,
+                observed_identity="runtime-creator",
+                error_category=None,
+                detail="",
+                next_action="",
+            )
+
+        def publish(self, request):
+            assert request.account == account
+            assert request.platform == "x"
+            assert request.dry_run is True
+            events.append("dry-run")
+            return PublishResult(
+                status=PublishStatus.SKIPPED,
+                evidence={"dry_run": True, "final_action_skipped": True},
+            )
+
+    adapter = Adapter()
+    configured_chrome = tmp_path / "Configured Chrome"
+    configured_chrome.write_text("chrome")
+    configured_chrome.chmod(0o700)
+
+    class Router:
+        def __init__(self):
+            self.browser_adapters = {
+                "x": SimpleNamespace(
+                    browser=SimpleNamespace(chrome_path=configured_chrome),
+                    config_root=tmp_path,
+                )
+            }
+
+        def select(self, supplied, platform):
+            assert supplied is account
+            assert platform == "x"
+            return adapter
+
+    class Narration:
+        command_identity = ["/usr/bin/true"]
+
+        def synthesize(self, text, output_path, voice):
+            events.append("narration")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"audio")
+            return output_path
+
+    builder = SimpleNamespace(
+        ffmpeg=Path("/usr/bin/true"),
+        ffprobe=Path("/usr/bin/true"),
+        image_provider=SimpleNamespace(command_identity=["/usr/bin/true"]),
+        narration_provider=Narration(),
+        voice="alloy",
+    )
+
+    runtime = SimpleNamespace(
+        accounts={"x": account},
+        router=Router(),
+        builder=builder,
+        probe=lambda platform: adapter.probe_auth(account),
+    )
+
+    monkeypatch.setattr(cli, "load_runtime", lambda *args, **kwargs: runtime)
+    monkeypatch.setattr(
+        "codex_media_ads.setup._default_tools",
+        lambda: {
+            name: (None if name == "chrome" else Path("/usr/bin/true"))
+            for name in (
+                "python",
+                "ffmpeg",
+                "ffprobe",
+                "chrome",
+                "playwright_browser",
+                "codimage",
+                "narration",
+            )
+        },
+    )
+    monkeypatch.setattr(
+        "codex_media_ads.setup.SetupService._synthetic_render", lambda self: True
+    )
+
+    exit_code = cli.main(
+        ["--state-root", str(tmp_path / "state"), "setup", "--enable", "x"]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0, (payload, events)
+    assert payload["status"] == "ready"
+    assert payload["checks"]["chrome"]["status"] == "ok"
+    assert payload["channels"]["x"]["background_enabled"] is True
+    assert {"probe", "narration", "dry-run"}.issubset(events)
+    saved = json.loads((tmp_path / "state" / "config" / "setup.json").read_text())
+    assert saved["channels"]["x"]["expected_identity"] == "runtime-creator"
+
+
+def test_setup_config_file_rejects_unknown_top_level_keys(tmp_path: Path) -> None:
+    path = tmp_path / "setup.json"
+    path.write_text(json.dumps({"channels": {}, "unexpected": True}))
+
+    with pytest.raises(ValueError, match="unknown setup configuration"):
+        cli._channel_config(path)
 
 
 def test_publish_next_unknown_is_failed_exit_four(
