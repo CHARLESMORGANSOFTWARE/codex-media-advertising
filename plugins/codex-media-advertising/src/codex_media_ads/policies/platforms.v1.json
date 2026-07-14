@@ -1,0 +1,9 @@
+{
+  "version": "platforms.v1",
+  "instagram": {"caption_max": 2200, "hashtags_max": 30, "aspect_ratio": "9:16"},
+  "tiktok": {"caption_max": 2200, "hashtags_max": 8, "aspect_ratio": "9:16"},
+  "youtube": {"title_max": 100, "description_max": 5000, "tags_chars_max": 500, "aspect_ratio": "9:16"},
+  "x": {"caption_max": 280, "hashtags_max": 4, "aspect_ratio": "9:16"},
+  "facebook": {"caption_max": 2200, "hashtags_max": 15, "aspect_ratio": "9:16"},
+  "threads": {"caption_max": 500, "hashtags_max": 5, "aspect_ratio": "9:16"}
+}
