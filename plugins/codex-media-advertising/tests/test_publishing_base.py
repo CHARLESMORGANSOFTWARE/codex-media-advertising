@@ -127,6 +127,9 @@ def test_adapter_exceptions_are_stable_and_redacted(exception: Exception, expect
         '{"token": "json-secret", "safe": true}',
         '{"access_token":"access-secret","refresh_token":"refresh-secret"}',
         "request failed?access_token=query-secret&safe=yes",
+        "Cookie: sid=cookie-secret; csrf=csrf-secret; theme=dark",
+        "Set-Cookie: sid=set-cookie-secret; Path=/; HttpOnly",
+        '{"cookies":[{"name":"sid","value":"jar-secret"}],"safe":true}',
     ],
 )
 def test_adapter_redaction_covers_headers_json_and_oauth_tokens(detail: str) -> None:
@@ -137,3 +140,7 @@ def test_adapter_redaction_covers_headers_json_and_oauth_tokens(detail: str) -> 
     assert "access-secret" not in result.detail
     assert "refresh-secret" not in result.detail
     assert "query-secret" not in result.detail
+    assert "cookie-secret" not in result.detail
+    assert "csrf-secret" not in result.detail
+    assert "set-cookie-secret" not in result.detail
+    assert "jar-secret" not in result.detail

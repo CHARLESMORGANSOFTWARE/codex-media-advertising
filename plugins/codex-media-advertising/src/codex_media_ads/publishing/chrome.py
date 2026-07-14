@@ -95,11 +95,19 @@ class ProcessRecord:
     pid: int
     parent_pid: int
     command: str
+    process_group_id: int | None = None
+    session_id: int | None = None
+    state: str = ""
+    start_token: str = ""
 
 
 def _system_process_table() -> list[ProcessRecord]:
     completed = subprocess.run(
-        ["ps", "-axo", "pid=,ppid=,command="],
+        [
+            "ps",
+            "-axo",
+            "pid=,ppid=,pgid=,sid=,state=,lstart=,command=",
+        ],
         check=False,
         capture_output=True,
         text=True,
@@ -107,11 +115,21 @@ def _system_process_table() -> list[ProcessRecord]:
     )
     records: list[ProcessRecord] = []
     for line in completed.stdout.splitlines():
-        parts = line.strip().split(maxsplit=2)
-        if len(parts) != 3:
+        parts = line.strip().split(maxsplit=10)
+        if len(parts) != 11:
             continue
         try:
-            records.append(ProcessRecord(int(parts[0]), int(parts[1]), parts[2]))
+            records.append(
+                ProcessRecord(
+                    pid=int(parts[0]),
+                    parent_pid=int(parts[1]),
+                    command=parts[10],
+                    process_group_id=int(parts[2]),
+                    session_id=int(parts[3]),
+                    state=parts[4],
+                    start_token=" ".join(parts[5:10]),
+                )
+            )
         except ValueError:
             continue
     return records
@@ -151,11 +169,15 @@ class ManagedChrome:
     log_path: Path
     process_table: Callable[[], Iterable[ProcessRecord]] = _system_process_table
     get_process_group: Callable[[int], int] = os.getpgid
+    get_session: Callable[[int], int] = os.getsid
     kill_group: Callable[[int, int], None] = os.killpg
     sleep: Callable[[float], None] = time.sleep
     monotonic: Callable[[], float] = time.monotonic
     _log_handle: object | None = field(default=None, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
+    _owned_process_group: int | None = field(default=None, init=False, repr=False)
+    _owned_session: int | None = field(default=None, init=False, repr=False)
+    _root_start_token: str = field(default="", init=False, repr=False)
 
     @property
     def cdp_url(self) -> str:
@@ -169,7 +191,7 @@ class ManagedChrome:
             # Popen.poll() returning None proves this is still our unreaped child,
             # so its PID cannot have been recycled. start_new_session=True makes
             # that PID the uniquely owned process-group ID.
-            process_group = self._verified_process_group()
+            process_group = self._establish_owned_identity()
             if process_group is None:
                 return
             try:
@@ -177,11 +199,17 @@ class ManagedChrome:
             except ProcessLookupError:
                 return
             deadline = self.monotonic() + 5.0
-            while self.monotonic() < deadline:
+            remaining: tuple[ProcessRecord, ...] = ()
+            while True:
+                remaining = self._remaining_owned_members()
+                if not remaining:
+                    # Reap the owned root only after no live group members remain.
+                    self.process.poll()
+                    return
+                if self.monotonic() >= deadline:
+                    break
                 self.sleep(0.1)
-            process_group = self._verified_process_group()
-            if process_group is None:
-                return
+            self._verify_owned_anchor()
             try:
                 self.kill_group(process_group, signal.SIGKILL)
             except ProcessLookupError:
@@ -192,11 +220,13 @@ class ManagedChrome:
                 if close is not None:
                     close()
 
-    def _verified_process_group(self) -> int | None:
+    def _establish_owned_identity(self) -> int | None:
         if self.process.poll() is not None:
             return None
-        matching = _matching_processes(self.process_table(), self.clone_root)
-        if self.process.pid not in matching:
+        records = tuple(self.process_table())
+        matching = _matching_processes(records, self.clone_root)
+        root = next((record for record in records if record.pid == self.process.pid), None)
+        if self.process.pid not in matching or root is None:
             raise RuntimeError(
                 "refusing to signal Chrome because clone process identity changed"
             )
@@ -205,7 +235,55 @@ class ManagedChrome:
             raise RuntimeError(
                 "refusing to signal Chrome because process group identity changed"
             )
+        session = self.get_session(self.process.pid)
+        if session != self.process.pid:
+            raise RuntimeError(
+                "refusing to signal Chrome because session identity changed"
+            )
+        if root.process_group_id not in (None, process_group):
+            raise RuntimeError("Chrome process table group identity is inconsistent")
+        if root.session_id not in (None, session):
+            raise RuntimeError("Chrome process table session identity is inconsistent")
+        self._owned_process_group = process_group
+        self._owned_session = session
+        self._root_start_token = root.start_token
         return process_group
+
+    def _owned_snapshot(self) -> tuple[ProcessRecord, ...]:
+        if self._owned_process_group is None or self._owned_session is None:
+            raise RuntimeError("Chrome process ownership was not established")
+        return tuple(
+            record
+            for record in self.process_table()
+            if record.process_group_id == self._owned_process_group
+            and record.session_id == self._owned_session
+        )
+
+    def _verify_owned_anchor(self) -> tuple[ProcessRecord, ...]:
+        records = self._owned_snapshot()
+        root = next((record for record in records if record.pid == self.process.pid), None)
+        if root is None:
+            raise RuntimeError("refusing to signal Chrome because owned root anchor vanished")
+        if self._root_start_token and root.start_token != self._root_start_token:
+            raise RuntimeError(
+                "refusing to signal Chrome because root start identity changed"
+            )
+        if root.state.upper().startswith("Z"):
+            if not self._root_start_token:
+                raise RuntimeError(
+                    "refusing to signal Chrome helpers without a stable root start identity"
+                )
+        elif self.process.pid not in _matching_processes(records, self.clone_root):
+            raise RuntimeError(
+                "refusing to signal Chrome because live root identity changed"
+            )
+        return records
+
+    def _remaining_owned_members(self) -> tuple[ProcessRecord, ...]:
+        records = self._verify_owned_anchor()
+        return tuple(
+            record for record in records if not record.state.upper().startswith("Z")
+        )
 
     def __enter__(self) -> ManagedChrome:
         return self
@@ -271,6 +349,7 @@ def launch_chrome(
     cdp_probe: Callable[[int], bool] = _probe_loopback_cdp,
     process_table: Callable[[], Iterable[ProcessRecord]] = _system_process_table,
     get_process_group: Callable[[int], int] = os.getpgid,
+    get_session: Callable[[int], int] = os.getsid,
     kill_group: Callable[[int, int], None] = os.killpg,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
@@ -333,6 +412,7 @@ def launch_chrome(
         log_path=log_path,
         process_table=process_table,
         get_process_group=get_process_group,
+        get_session=get_session,
         kill_group=kill_group,
         sleep=sleep,
         monotonic=monotonic,

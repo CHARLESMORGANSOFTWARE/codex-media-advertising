@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from codex_media_ads.publishing.chrome import (
     clone_profile,
     launch_chrome,
 )
+from codex_media_ads.publishing import chrome as chrome_module
 
 
 def test_safe_chrome_api_is_exported_from_publishing_package() -> None:
@@ -19,6 +21,29 @@ def test_safe_chrome_api_is_exported_from_publishing_package() -> None:
 
     assert ExportedChrome is ManagedChrome
     assert exported_clone is clone_profile
+
+
+def test_process_table_captures_group_session_state_and_stable_start(monkeypatch) -> None:
+    output = (
+        "  101  1  101  101  S  Tue Jul 14 12:34:56 2026 "
+        "/Applications/Google Chrome --user-data-dir=/private/run\n"
+    )
+    monkeypatch.setattr(
+        chrome_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=output),
+    )
+    assert chrome_module._system_process_table() == [
+        ProcessRecord(
+            101,
+            1,
+            "/Applications/Google Chrome --user-data-dir=/private/run",
+            101,
+            101,
+            "S",
+            "Tue Jul 14 12:34:56 2026",
+        )
+    ]
 
 
 def make_source(root: Path) -> Path:
@@ -146,16 +171,16 @@ def test_close_terms_then_kills_only_processes_matching_clone_root(tmp_path: Pat
     tables = iter(
         [
             [
-                ProcessRecord(101, 1, f"chrome {marker}"),
-                ProcessRecord(102, 101, "chrome helper"),
-                ProcessRecord(999, 1, "Google Chrome --user-data-dir=/someone/else"),
-                ProcessRecord(998, 1, f"Google Chrome {marker}-suffix"),
+                ProcessRecord(101, 1, f"chrome {marker}", 101, 101, "S", "root-start"),
+                ProcessRecord(102, 101, "chrome helper", 101, 101, "S", "helper-start"),
+                ProcessRecord(999, 1, "Google Chrome --user-data-dir=/someone/else", 999, 999, "S", "other"),
+                ProcessRecord(998, 1, f"Google Chrome {marker}-suffix", 998, 998, "S", "suffix"),
             ],
             [
-                ProcessRecord(101, 1, f"chrome {marker}"),
-                ProcessRecord(102, 101, "chrome helper"),
-                ProcessRecord(999, 1, "Google Chrome --user-data-dir=/someone/else"),
-                ProcessRecord(998, 1, f"Google Chrome {marker}-suffix"),
+                ProcessRecord(101, 1, f"chrome {marker}", 101, 101, "S", "root-start"),
+                ProcessRecord(102, 101, "chrome helper", 101, 101, "S", "helper-start"),
+                ProcessRecord(999, 1, "Google Chrome --user-data-dir=/someone/else", 999, 999, "S", "other"),
+                ProcessRecord(998, 1, f"Google Chrome {marker}-suffix", 998, 998, "S", "suffix"),
             ],
         ]
     )
@@ -179,6 +204,7 @@ def test_close_terms_then_kills_only_processes_matching_clone_root(tmp_path: Pat
         process_table=process_table,
         kill_group=lambda pgid, sig: signals.append((pgid, sig)),
         get_process_group=lambda pid: pid,
+        get_session=lambda pid: pid,
         sleep=lambda _: None,
         monotonic=lambda: next(clock),
     )
@@ -201,6 +227,7 @@ def test_close_is_idempotent_and_never_invokes_broad_process_kill(tmp_path: Path
         process_table=lambda: [],
         kill_group=lambda pgid, sig: signals.append((pgid, sig)),
         get_process_group=lambda pid: pid,
+        get_session=lambda pid: pid,
         sleep=lambda _: None,
         monotonic=lambda: 0.0,
     )
@@ -220,8 +247,9 @@ def test_close_refuses_stale_snapshot_pid_and_never_signals_reused_process(tmp_p
         clone_root=clone,
         port=1234,
         log_path=tmp_path / "run.log",
-        process_table=lambda: [ProcessRecord(401, 1, f"chrome {marker}")],
+        process_table=lambda: [ProcessRecord(401, 1, f"chrome {marker}", 777, 401, "S", "root-start")],
         get_process_group=lambda _pid: 777,
+        get_session=lambda _pid: 401,
         kill_group=lambda pgid, sig: signals.append((pgid, sig)),
     )
     with pytest.raises(RuntimeError, match="process group identity"):
@@ -240,6 +268,7 @@ def test_close_closes_log_and_remains_idempotent_when_discovery_raises(tmp_path:
         log_path=tmp_path / "run.log",
         process_table=lambda: (_ for _ in ()).throw(OSError("ps failed")),
         get_process_group=lambda pid: pid,
+        get_session=lambda pid: pid,
         kill_group=lambda _pgid, _sig: None,
         _log_handle=log,
     )
@@ -259,8 +288,9 @@ def test_close_closes_log_and_remains_idempotent_when_group_signal_raises(tmp_pa
         clone_root=clone,
         port=1234,
         log_path=tmp_path / "run.log",
-        process_table=lambda: [ProcessRecord(401, 1, f"chrome {marker}")],
+        process_table=lambda: [ProcessRecord(401, 1, f"chrome {marker}", 401, 401, "S", "root-start")],
         get_process_group=lambda pid: pid,
+        get_session=lambda pid: pid,
         kill_group=lambda _pgid, _sig: (_ for _ in ()).throw(OSError("signal failed")),
         _log_handle=log,
     )
@@ -268,6 +298,116 @@ def test_close_closes_log_and_remains_idempotent_when_group_signal_raises(tmp_pa
         chrome.close()
     assert log.closed
     chrome.close()
+
+
+def test_close_kills_owned_helpers_after_root_exits_without_touching_unrelated_group(tmp_path: Path) -> None:
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    marker = f"--user-data-dir={clone.resolve()}"
+    snapshots = iter(
+        [
+            [ProcessRecord(501, 1, f"chrome {marker}", 501, 501, "S", "root-start")],
+            [
+                ProcessRecord(501, 1, "[chrome] <defunct>", 501, 501, "Z", "root-start"),
+                ProcessRecord(502, 1, "chrome helper", 501, 501, "S", "helper-start"),
+                ProcessRecord(900, 1, "unrelated", 900, 900, "S", "other-start"),
+            ],
+            [
+                ProcessRecord(501, 1, "[chrome] <defunct>", 501, 501, "Z", "root-start"),
+                ProcessRecord(502, 1, "chrome helper", 501, 501, "S", "helper-start"),
+                ProcessRecord(900, 1, "unrelated", 900, 900, "S", "other-start"),
+            ],
+        ]
+    )
+    last = []
+
+    def process_table():
+        nonlocal last
+        try:
+            last = next(snapshots)
+        except StopIteration:
+            pass
+        return last
+
+    signals: list[tuple[int, int]] = []
+    clock = iter([0.0, 0.0, 6.0])
+    chrome = ManagedChrome(
+        process=FakeProcess(501),
+        clone_root=clone,
+        port=1234,
+        log_path=tmp_path / "run.log",
+        process_table=process_table,
+        get_process_group=lambda pid: pid,
+        get_session=lambda pid: pid,
+        kill_group=lambda pgid, sig: signals.append((pgid, sig)),
+        sleep=lambda _seconds: None,
+        monotonic=lambda: next(clock),
+    )
+    chrome.close()
+    assert signals == [(501, 15), (501, 9)]
+
+
+def test_close_returns_early_when_only_owned_zombie_and_unrelated_processes_remain(tmp_path: Path) -> None:
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    marker = f"--user-data-dir={clone.resolve()}"
+    snapshots = iter(
+        [
+            [ProcessRecord(601, 1, f"chrome {marker}", 601, 601, "S", "root-start")],
+            [
+                ProcessRecord(601, 1, "[chrome] <defunct>", 601, 601, "Z", "root-start"),
+                ProcessRecord(999, 1, "unrelated", 999, 999, "S", "other-start"),
+            ],
+        ]
+    )
+    signals: list[tuple[int, int]] = []
+    sleeps: list[float] = []
+    chrome = ManagedChrome(
+        process=FakeProcess(601),
+        clone_root=clone,
+        port=1234,
+        log_path=tmp_path / "run.log",
+        process_table=lambda: next(snapshots),
+        get_process_group=lambda pid: pid,
+        get_session=lambda pid: pid,
+        kill_group=lambda pgid, sig: signals.append((pgid, sig)),
+        sleep=lambda seconds: sleeps.append(seconds),
+        monotonic=lambda: 0.0,
+    )
+    chrome.close()
+    assert signals == [(601, 15)]
+    assert sleeps == []
+
+
+def test_close_refuses_kill_when_root_start_identity_changes_after_term(tmp_path: Path) -> None:
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    marker = f"--user-data-dir={clone.resolve()}"
+    snapshots = iter(
+        [
+            [ProcessRecord(701, 1, f"chrome {marker}", 701, 701, "S", "original-start")],
+            [
+                ProcessRecord(701, 1, "reused process", 701, 701, "S", "different-start"),
+                ProcessRecord(702, 701, "reused helper", 701, 701, "S", "helper-start"),
+            ],
+        ]
+    )
+    signals: list[tuple[int, int]] = []
+    chrome = ManagedChrome(
+        process=FakeProcess(701),
+        clone_root=clone,
+        port=1234,
+        log_path=tmp_path / "run.log",
+        process_table=lambda: next(snapshots),
+        get_process_group=lambda pid: pid,
+        get_session=lambda pid: pid,
+        kill_group=lambda pgid, sig: signals.append((pgid, sig)),
+        sleep=lambda _seconds: None,
+        monotonic=lambda: 0.0,
+    )
+    with pytest.raises(RuntimeError, match="root start identity changed"):
+        chrome.close()
+    assert signals == [(701, 15)]
 
 
 def test_launch_waits_for_cdp_and_reports_redacted_bounded_log_on_early_exit(tmp_path: Path) -> None:

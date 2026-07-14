@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
@@ -187,6 +188,12 @@ _AUTHORIZATION_HEADER = re.compile(
 _AUTHORIZATION_SPACE = re.compile(
     r"(?im)(\bauthorization\b\s+)(?![:=])[^\r\n]+"
 )
+_COOKIE_HEADER = re.compile(
+    r"(?im)(\b(?:set-cookie|cookie)\b\s*[:=]\s*)[^\r\n]+"
+)
+_COOKIE_JSON_CONTAINER = re.compile(
+    r"(?is)([\"']?cookies[\"']?\s*[:=]\s*)(?:\[[^\]]*\]|\{[^}]*\})"
+)
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)([\"']?(?:access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|"
     r"password|cookie|api[_-]?key|oauth[_-]?code)[\"']?\s*[:=]\s*)"
@@ -196,10 +203,22 @@ _BEARER_VALUE = re.compile(r"(?i)(\bbearer\s+)[^\s,;]+")
 
 
 def redact_diagnostic(value: str) -> str:
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    else:
+        value = json.dumps(_redact_json_value(parsed), ensure_ascii=False)
     redacted = _AUTHORIZATION_HEADER.sub(
         lambda match: f"{match.group(1)}[REDACTED]", value
     )
     redacted = _AUTHORIZATION_SPACE.sub(
+        lambda match: f"{match.group(1)}[REDACTED]", redacted
+    )
+    redacted = _COOKIE_HEADER.sub(
+        lambda match: f"{match.group(1)}[REDACTED]", redacted
+    )
+    redacted = _COOKIE_JSON_CONTAINER.sub(
         lambda match: f"{match.group(1)}[REDACTED]", redacted
     )
     redacted = _SECRET_ASSIGNMENT.sub(
@@ -209,6 +228,32 @@ def redact_diagnostic(value: str) -> str:
         lambda match: f"{match.group(1)}[REDACTED]", redacted
     )
     return redacted[:1000]
+
+
+def _redact_json_value(value: object) -> object:
+    if isinstance(value, dict):
+        output: dict[str, object] = {}
+        for key, item in value.items():
+            normalized = str(key).casefold().replace("-", "_")
+            if any(
+                part in normalized
+                for part in (
+                    "cookie",
+                    "token",
+                    "secret",
+                    "password",
+                    "authorization",
+                    "api_key",
+                    "oauth_code",
+                )
+            ):
+                output[str(key)] = "[REDACTED]"
+            else:
+                output[str(key)] = _redact_json_value(item)
+        return output
+    if isinstance(value, list):
+        return [_redact_json_value(item) for item in value]
+    return value
 
 
 def normalize_adapter_error(exc: BaseException) -> AdapterError:
