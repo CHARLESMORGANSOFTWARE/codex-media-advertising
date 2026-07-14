@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import plistlib
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -391,6 +392,94 @@ def test_uninstall_allows_safe_root_when_home_has_symlinked_ancestor(
     )
 
     assert result.returncode == 0
+
+
+def test_install_dry_run_prints_speech_handoff_without_writing(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    install_root = home / ".local" / "share" / "codex-media-ads"
+    state_root = home / ".codex-media-ads"
+    script = Path(__file__).parents[1] / "scripts" / "install.sh"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(home),
+            "CODEX_MEDIA_ADS_INSTALL_ROOT": str(install_root),
+            "CODEX_MEDIA_ADS_STATE_ROOT": str(state_root),
+            "PYTHON_BIN": sys.executable,
+        }
+    )
+
+    result = subprocess.run(
+        ["/bin/sh", str(script), "--dry-run"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "scripts/install_speech.py" in result.stdout
+    assert "dependencies/speech.lock.json" in result.stdout
+    assert f"--install-root' '{install_root}" in result.stdout
+    assert "--dry-run" in result.stdout
+    assert "no files changed and no LaunchAgent loaded" in result.stdout
+    assert not install_root.exists()
+    assert not state_root.exists()
+    assert not (home / "Library" / "LaunchAgents").exists()
+
+
+def test_install_invokes_speech_helper_after_base_package_install(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    install_root = home / ".local" / "share" / "codex-media-ads"
+    state_root = home / ".codex-media-ads"
+    calls_path = tmp_path / "python-calls.txt"
+    fake_python = tmp_path / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> '{calls_path}'\n"
+        "if [ \"$1\" = '-m' ] && [ \"$2\" = 'venv' ]; then\n"
+        "    mkdir -p \"$3/bin\"\n"
+        "    cp \"$0\" \"$3/bin/python\"\n"
+        "fi\n"
+    )
+    fake_python.chmod(0o700)
+    script = Path(__file__).parents[1] / "scripts" / "install.sh"
+    plugin_root = script.parent.parent
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(home),
+            "CODEX_MEDIA_ADS_INSTALL_ROOT": str(install_root),
+            "CODEX_MEDIA_ADS_STATE_ROOT": str(state_root),
+            "PYTHON_BIN": str(fake_python),
+        }
+    )
+
+    result = subprocess.run(
+        ["/bin/sh", str(script)],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    calls = calls_path.read_text().splitlines()
+    assert calls == [
+        f"-m venv {install_root}/venv",
+        f"-m pip install --upgrade {plugin_root}",
+        (
+            f"{plugin_root}/scripts/install_speech.py "
+            f"--lock {plugin_root}/dependencies/speech.lock.json "
+            f"--install-root {install_root}"
+        ),
+    ]
 
 
 @pytest.mark.parametrize("alias_kind", ["dotdot", "symlink"])

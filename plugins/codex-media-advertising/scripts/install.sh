@@ -34,6 +34,10 @@ if [ "$DRY_RUN" = true ]; then
     print_command chmod 700 "$INSTALL_ROOT" "$STATE_ROOT"
     print_command "$PYTHON_BIN" -m venv "$INSTALL_ROOT/venv"
     print_command "$INSTALL_ROOT/venv/bin/python" -m pip install --upgrade "$PLUGIN_ROOT"
+    print_command "$PYTHON_BIN" "$PLUGIN_ROOT/scripts/install_speech.py" \
+        --lock "$PLUGIN_ROOT/dependencies/speech.lock.json" \
+        --install-root "$INSTALL_ROOT" \
+        --dry-run
     printf '%s\n' "dry-run: no files changed and no LaunchAgent loaded"
     exit 0
 fi
@@ -42,6 +46,9 @@ mkdir -p "$INSTALL_ROOT" "$STATE_ROOT"
 chmod 700 "$INSTALL_ROOT" "$STATE_ROOT"
 "$PYTHON_BIN" -m venv "$INSTALL_ROOT/venv"
 "$INSTALL_ROOT/venv/bin/python" -m pip install --upgrade "$PLUGIN_ROOT"
+"$INSTALL_ROOT/venv/bin/python" "$PLUGIN_ROOT/scripts/install_speech.py" \
+    --lock "$PLUGIN_ROOT/dependencies/speech.lock.json" \
+    --install-root "$INSTALL_ROOT"
 
 printf '%s\n' "Installed codex-media-ads at $INSTALL_ROOT/venv/bin/codex-media-ads"
 printf '%s\n' "Private state is preserved at $STATE_ROOT"

@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "git_url": "https://github.com/speaches-ai/speaches.git",
+  "git_revision": "22ba05d9c00dfb4302e2403d82ad786a48db3e3b",
+  "python_version": "3.12",
+  "uv_version": "0.10.12",
+  "tts_model": "speaches-ai/Kokoro-82M-v1.0-ONNX",
+  "stt_model": "Systran/faster-distil-whisper-small.en"
+}
