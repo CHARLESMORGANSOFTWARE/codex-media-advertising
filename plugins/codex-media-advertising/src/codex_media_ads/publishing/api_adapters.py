@@ -814,6 +814,29 @@ class YouTubePublisher(_PublisherBase):
             return 0
         return min(int(match.group(1)) + 1, total)
 
+    def _advance_confirmed_high_water(
+        self,
+        *,
+        reported_offset: int,
+        confirmed_high_water: int,
+        stalled_responses: int,
+        final_chunk_was_sent: bool,
+    ) -> tuple[int, int]:
+        if reported_offset > confirmed_high_water:
+            return reported_offset, 0
+        stalled_responses += 1
+        if stalled_responses >= self.max_resume_attempts:
+            if final_chunk_was_sent:
+                raise _AmbiguousSubmit(
+                    "YouTube final upload could not make monotonic confirmed progress; reconcile before retrying"
+                )
+            raise _ApiFailure(
+                "YouTube resumable reconciliation made no monotonic progress before the retry limit"
+            )
+        # Missing, malformed, equal, and regressing Range reports never lower
+        # the next send offset and never reset the stall budget.
+        return confirmed_high_water, stalled_responses
+
     def _query_upload_status(
         self,
         *,
@@ -886,21 +909,25 @@ class YouTubePublisher(_PublisherBase):
         content_type: str,
         access_token: str,
     ) -> dict[str, object]:
-        offset = 0
+        confirmed_high_water = 0
         stalled_responses = 0
         with media_path.open("rb") as media:
-            while offset < media_size:
-                media.seek(offset)
-                chunk = media.read(min(self.chunk_size, media_size - offset))
+            while confirmed_high_water < media_size:
+                media.seek(confirmed_high_water)
+                chunk = media.read(
+                    min(self.chunk_size, media_size - confirmed_high_water)
+                )
                 if not chunk:
                     raise _ApiFailure("YouTube media ended before its declared size")
-                end = offset + len(chunk) - 1
+                end = confirmed_high_water + len(chunk) - 1
                 final_chunk = end + 1 == media_size
                 headers = {
                     "Authorization": f"Bearer {access_token}",
                     "Content-Length": str(len(chunk)),
                     "Content-Type": content_type,
-                    "Content-Range": f"bytes {offset}-{end}/{media_size}",
+                    "Content-Range": (
+                        f"bytes {confirmed_high_water}-{end}/{media_size}"
+                    ),
                 }
                 try:
                     response = self.transport.request(
@@ -925,15 +952,14 @@ class YouTubePublisher(_PublisherBase):
                     )
                     if completed is not None:
                         return completed
-                    if next_offset <= offset:
-                        stalled_responses += 1
-                        if stalled_responses >= self.max_resume_attempts:
-                            raise _ApiFailure(
-                                "YouTube resumable reconciliation made no progress before the retry limit"
-                            )
-                    else:
-                        stalled_responses = 0
-                    offset = next_offset
+                    confirmed_high_water, stalled_responses = (
+                        self._advance_confirmed_high_water(
+                            reported_offset=next_offset,
+                            confirmed_high_water=confirmed_high_water,
+                            stalled_responses=stalled_responses,
+                            final_chunk_was_sent=final_chunk,
+                        )
+                    )
                     continue
 
                 try:
@@ -948,15 +974,14 @@ class YouTubePublisher(_PublisherBase):
                     ) from exc
                 if status_code == 308:
                     next_offset = self._resume_offset(response, media_size)
-                    if next_offset <= offset:
-                        stalled_responses += 1
-                        if stalled_responses >= self.max_resume_attempts:
-                            raise _ApiFailure(
-                                "YouTube resumable upload made no progress before the retry limit"
-                            )
-                    else:
-                        stalled_responses = 0
-                    offset = next_offset
+                    confirmed_high_water, stalled_responses = (
+                        self._advance_confirmed_high_water(
+                            reported_offset=next_offset,
+                            confirmed_high_water=confirmed_high_water,
+                            stalled_responses=stalled_responses,
+                            final_chunk_was_sent=final_chunk,
+                        )
+                    )
                     continue
                 if status_code in {500, 502, 503, 504}:
                     next_offset, completed = self._query_upload_status(
@@ -967,15 +992,14 @@ class YouTubePublisher(_PublisherBase):
                     )
                     if completed is not None:
                         return completed
-                    if next_offset <= offset:
-                        stalled_responses += 1
-                        if stalled_responses >= self.max_resume_attempts:
-                            raise _ApiFailure(
-                                "YouTube resumable reconciliation made no progress before the retry limit"
-                            )
-                    else:
-                        stalled_responses = 0
-                    offset = next_offset
+                    confirmed_high_water, stalled_responses = (
+                        self._advance_confirmed_high_water(
+                            reported_offset=next_offset,
+                            confirmed_high_water=confirmed_high_water,
+                            stalled_responses=stalled_responses,
+                            final_chunk_was_sent=final_chunk,
+                        )
+                    )
                     continue
                 if 200 <= status_code < 300:
                     return _response_json(
@@ -984,7 +1008,9 @@ class YouTubePublisher(_PublisherBase):
                         ambiguous_success=True,
                     )
                 _response_json(response, "YouTube media upload")
-        raise _ApiFailure("YouTube upload ended without a completion response")
+        raise _AmbiguousSubmit(
+            "YouTube upload bytes were confirmed without a completion response; reconcile before retrying"
+        )
 
 
 class XPublisher(_PublisherBase):

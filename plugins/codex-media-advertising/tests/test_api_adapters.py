@@ -404,7 +404,8 @@ def test_youtube_repeated_zero_progress_reconciliation_is_bounded(
         sleep=lambda _seconds: None,
     ).publish(_request(tmp_path, platform="youtube", metadata={"title": "title"}))
 
-    assert result.status == "failed"
+    assert result.status == "unknown"
+    assert result.error_category == "ambiguous_submit"
     assert result.evidence["retry_safe"] is False
     assert len([call for call in transport.calls if call[0] == "PUT"]) == 4
     assert transport.responses == []
@@ -432,9 +433,94 @@ def test_youtube_repeated_5xx_zero_progress_reconciliation_is_bounded(
         sleep=lambda _seconds: None,
     ).publish(_request(tmp_path, platform="youtube", metadata={"title": "title"}))
 
-    assert result.status == "failed"
+    assert result.status == "unknown"
+    assert result.error_category == "ambiguous_submit"
     assert result.evidence["retry_safe"] is False
     assert len([call for call in transport.calls if call[0] == "PUT"]) == 4
+    assert transport.responses == []
+
+
+def test_youtube_range_recovery_is_monotonic_and_regressions_consume_budget(
+    tmp_path: Path,
+) -> None:
+    from codex_media_ads.publishing.api_adapters import YouTubePublisher
+
+    transport = QueueTransport(
+        [
+            FakeResponse({"items": [{"snippet": {"title": "expected-account"}}]}),
+            EmptyResponse(headers={"Location": "https://upload.example/session-1"}),
+            EmptyResponse(status_code=308, headers={"Range": "bytes=0-3"}),
+            EmptyResponse(status_code=308),
+            EmptyResponse(status_code=308, headers={"Range": "bytes=0-1"}),
+            EmptyResponse(status_code=308, headers={"Range": "bytes=0-3"}),
+        ]
+    )
+
+    result = YouTubePublisher(
+        transport,
+        max_resume_attempts=3,
+        sleep=lambda _seconds: None,
+    ).publish(_request(tmp_path, platform="youtube", metadata={"title": "title"}))
+
+    assert result.status == "unknown"
+    assert result.error_category == "ambiguous_submit"
+    assert result.evidence["retry_safe"] is False
+    upload_puts = [
+        call
+        for call in transport.calls
+        if call[0] == "PUT" and call[2]["headers"].get("Content-Length") != "0"
+    ]
+    starts = [
+        int(str(call[2]["headers"]["Content-Range"]).split()[1].split("-")[0])
+        for call in upload_puts
+    ]
+    assert starts == [0, 4, 4, 4]
+    assert starts == sorted(starts)
+    assert transport.responses == []
+
+
+@pytest.mark.parametrize("recovery_kind", ["connection", "5xx"])
+def test_youtube_reconciled_ranges_are_monotonic_for_all_recovery_branches(
+    tmp_path: Path, recovery_kind: str
+) -> None:
+    from codex_media_ads.publishing.api_adapters import YouTubePublisher
+
+    interrupted: FakeResponse | BaseException
+    if recovery_kind == "connection":
+        interrupted = TimeoutError("upload response lost")
+    else:
+        interrupted = FakeResponse(status_code=503, text="unavailable")
+    transport = QueueTransport(
+        [
+            FakeResponse({"items": [{"snippet": {"title": "expected-account"}}]}),
+            EmptyResponse(headers={"Location": "https://upload.example/session-1"}),
+            EmptyResponse(status_code=308, headers={"Range": "bytes=0-3"}),
+            interrupted,
+            EmptyResponse(status_code=308, headers={"Range": "bytes=0-1"}),
+            interrupted,
+            EmptyResponse(status_code=308, headers={"Range": "bytes=0-3"}),
+        ]
+    )
+
+    result = YouTubePublisher(
+        transport,
+        max_resume_attempts=2,
+        sleep=lambda _seconds: None,
+    ).publish(_request(tmp_path, platform="youtube", metadata={"title": "title"}))
+
+    assert result.status == "unknown"
+    assert result.error_category == "ambiguous_submit"
+    upload_puts = [
+        call
+        for call in transport.calls
+        if call[0] == "PUT" and call[2]["headers"].get("Content-Length") != "0"
+    ]
+    starts = [
+        int(str(call[2]["headers"]["Content-Range"]).split()[1].split("-")[0])
+        for call in upload_puts
+    ]
+    assert starts == [0, 4, 4]
+    assert starts == sorted(starts)
     assert transport.responses == []
 
 
