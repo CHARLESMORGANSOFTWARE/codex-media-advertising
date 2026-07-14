@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
+from importlib import import_module
 from importlib.resources import files
 from pathlib import Path
 from typing import Callable, Mapping, Protocol, cast
@@ -46,6 +48,116 @@ class BrowserPage(Protocol):
     def wait_for(self, locator: Locator) -> None: ...
 
 
+class BrowserDependencyError(RuntimeError):
+    """Raised when the optional browser runtime is not installed."""
+
+
+class BrowserUIError(RuntimeError):
+    """Raised when a required, pre-submit platform control is unavailable."""
+
+
+class PlaywrightBrowserPage:
+    """Synchronous Playwright page attached to an isolated Chrome CDP endpoint.
+
+    Playwright is imported only when a browser connection is requested, so the
+    core package and non-browser adapters remain usable without the optional
+    ``browser`` dependency group.
+    """
+
+    def __init__(self, page: object, playwright: object, browser: object) -> None:
+        self._page = page
+        self._playwright = playwright
+        self._browser = browser
+        self._closed = False
+
+    @classmethod
+    def connect(cls, cdp_url: str) -> PlaywrightBrowserPage:
+        try:
+            sync_api = import_module("playwright.sync_api")
+        except ModuleNotFoundError as exc:
+            if exc.name not in {"playwright", "playwright.sync_api"}:
+                raise
+            raise BrowserDependencyError(
+                "browser dependency playwright is unavailable; install "
+                "codex-media-advertising[browser]"
+            ) from exc
+        manager = sync_api.sync_playwright().start()
+        try:
+            browser = manager.chromium.connect_over_cdp(cdp_url)
+            contexts = list(browser.contexts)
+            if not contexts:
+                raise BrowserUIError("managed Chrome exposed no browser context over CDP")
+            page = contexts[0].new_page()
+        except BaseException:
+            manager.stop()
+            raise
+        return cls(page, manager, browser)
+
+    def goto(self, url: str) -> None:
+        self._page.goto(url)
+
+    def body_text(self) -> str:
+        return str(self._page.locator("body").inner_text())
+
+    def current_url(self) -> str:
+        return str(self._page.url)
+
+    def text(self, locator: Locator) -> str:
+        return str(self._resolve(locator).inner_text() or "")
+
+    def attribute(self, locator: Locator, name: str) -> str:
+        return str(self._resolve(locator).get_attribute(name) or "")
+
+    def is_visible(self, locator: Locator) -> bool:
+        return bool(self._resolve(locator).is_visible())
+
+    def click(self, locator: Locator) -> None:
+        self._resolve(locator).click()
+
+    def fill(self, locator: Locator, value: str) -> None:
+        self._resolve(locator).fill(value)
+
+    def set_input_files(self, locator: Locator, path: Path) -> None:
+        self._resolve(locator).set_input_files(str(path))
+
+    def select_option(self, locator: Locator, value: str) -> None:
+        self._resolve(locator).select_option(value)
+
+    def check(self, locator: Locator, checked: bool) -> None:
+        target = self._resolve(locator)
+        if checked:
+            target.check()
+        else:
+            target.uncheck()
+
+    def wait_for(self, locator: Locator) -> None:
+        self._resolve(locator).wait_for(state="visible")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._page.close()
+        finally:
+            # Stopping Playwright disconnects this client. ManagedChrome owns
+            # and terminates the isolated Chrome process itself.
+            self._playwright.stop()
+
+    def _resolve(self, locator: Locator) -> object:
+        kind = locator["kind"]
+        value = locator["value"]
+        if kind == "role":
+            target = self._page.get_by_role(value, name=locator["name"])
+        elif kind == "text":
+            target = self._page.get_by_text(value, exact=False)
+        elif kind == "label":
+            target = self._page.get_by_label(value, exact=False)
+        else:
+            target = self._page.locator(value)
+        return target.first
+
+
 _SELECTOR_RESOURCE = "browser_selectors.v1.json"
 _SEMANTIC_KINDS = {"role", "text", "label"}
 _CSS_PURPOSES = {"upload", "stable_control"}
@@ -58,12 +170,59 @@ _REQUIRED_LOCATORS = {
     "permalink",
     "platform_id",
 }
+_PLATFORM_REQUIRED_LOCATORS = {
+    "instagram": {"create", "advance"},
+    "tiktok": {
+        "filename_slug",
+        "allow_comments",
+        "allow_duet",
+        "allow_stitch",
+        "schedule_mode",
+        "schedule_date",
+        "schedule_time",
+        "schedule_submit",
+    },
+    "youtube": {
+        "identity_menu",
+        "create",
+        "title",
+        "description",
+        "audience_made_for_kids",
+        "audience_not_made_for_kids",
+        "synthetic_media",
+        "visibility",
+        "schedule_mode",
+        "schedule_date",
+        "schedule_time",
+        "schedule_submit",
+    },
+    "x": {"processing"},
+    "facebook": {
+        "schedule_mode",
+        "schedule_date",
+        "schedule_time",
+        "schedule_submit",
+    },
+    "threads": {"create"},
+}
 _GENERIC_LOGGED_OUT = re.compile(r"\b(?:log\s*in|sign\s*in)\b", re.IGNORECASE)
+_GENERIC_IDENTITIES = {
+    "account",
+    "account menu",
+    "profile",
+    "your account",
+    "your profile",
+}
 _PLATFORM_FIELDS = {
     "url",
     "login_markers",
     "post_link_pattern",
     "supports_schedule",
+    "identity_evidence",
+    "confirmation_pattern",
+    "platform_id_pattern",
+    "schedule_confirmation_pattern",
+    "before_probe",
     "before_upload",
     "after_upload",
     "locators",
@@ -106,27 +265,69 @@ def _validate_selector_data(data: object) -> dict[str, object]:
         ):
             raise ValueError(f"{platform} login markers must be non-empty strings")
         pattern = raw_config.get("post_link_pattern")
-        if not isinstance(pattern, str) or not pattern:
-            raise ValueError(f"{platform} post link pattern is required")
-        try:
-            re.compile(pattern)
-        except re.error as exc:
-            raise ValueError(f"{platform} post link pattern is invalid") from exc
+        _validate_pattern(platform, "post_link_pattern", pattern)
+        _validate_pattern(
+            platform, "confirmation_pattern", raw_config.get("confirmation_pattern")
+        )
+        _validate_pattern(
+            platform, "platform_id_pattern", raw_config.get("platform_id_pattern")
+        )
         if not isinstance(raw_config.get("supports_schedule"), bool):
             raise ValueError(f"{platform} supports_schedule must be boolean")
+        if raw_config["supports_schedule"]:
+            _validate_pattern(
+                platform,
+                "schedule_confirmation_pattern",
+                raw_config.get("schedule_confirmation_pattern"),
+            )
+        elif raw_config.get("schedule_confirmation_pattern") is not None:
+            raise ValueError(
+                f"{platform} schedule confirmation is only valid when scheduling is supported"
+            )
         locators = raw_config.get("locators")
-        if not isinstance(locators, dict) or not _REQUIRED_LOCATORS <= set(locators):
-            missing = sorted(_REQUIRED_LOCATORS - set(locators or {}))
+        required_locators = _REQUIRED_LOCATORS | _PLATFORM_REQUIRED_LOCATORS[platform]
+        if not isinstance(locators, dict) or not required_locators <= set(locators):
+            missing = sorted(required_locators - set(locators or {}))
             raise ValueError(f"{platform} selectors are missing locators: {', '.join(missing)}")
         for purpose, raw_locator in locators.items():
             _validate_locator(platform, str(purpose), raw_locator)
-        for key in ("before_upload", "after_upload"):
+        for key in ("before_probe", "before_upload", "after_upload"):
             sequence = raw_config.get(key, [])
             if not isinstance(sequence, list) or not all(
                 isinstance(name, str) and name in locators for name in sequence
             ):
                 raise ValueError(f"{platform} {key} must reference known locators")
+        identity_evidence = raw_config.get("identity_evidence")
+        if not isinstance(identity_evidence, list) or not identity_evidence:
+            raise ValueError(f"{platform} identity evidence is required")
+        for item in identity_evidence:
+            _validate_identity_evidence(platform, item)
     return cast(dict[str, object], data)
+
+
+def _validate_pattern(platform: str, field: str, value: object) -> None:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{platform} {field.replace('_', ' ')} is required")
+    try:
+        re.compile(value)
+    except re.error as exc:
+        raise ValueError(f"{platform} {field.replace('_', ' ')} is invalid") from exc
+
+
+def _validate_identity_evidence(platform: str, value: object) -> None:
+    if not isinstance(value, dict) or set(value) - {"source", "attribute", "pattern"}:
+        raise ValueError(f"{platform} identity evidence entry is invalid")
+    source = value.get("source")
+    if source not in {"text", "attribute"}:
+        raise ValueError(f"{platform} identity evidence source is invalid")
+    if source == "attribute" and not isinstance(value.get("attribute"), str):
+        raise ValueError(f"{platform} identity attribute is required")
+    if source == "text" and "attribute" in value:
+        raise ValueError(f"{platform} text identity evidence cannot name an attribute")
+    _validate_pattern(platform, "identity_pattern", value.get("pattern"))
+    compiled = re.compile(cast(str, value["pattern"]))
+    if "identity" not in compiled.groupindex:
+        raise ValueError(f"{platform} identity pattern must define an identity group")
 
 
 def _valid_https_url(value: object) -> bool:
@@ -191,11 +392,13 @@ class BrowserPublisher:
         cls,
         platform: str,
         chrome: ManagedChrome,
-        connector: Callable[[str], BrowserPage],
+        connector: Callable[[str], BrowserPage] | None = None,
         selectors: Mapping[str, object] | None = None,
     ) -> BrowserPublisher:
         """Connect a page abstraction to Task 6's isolated loopback CDP runtime."""
 
+        if connector is None:
+            connector = PlaywrightBrowserPage.connect
         page = connector(chrome.cdp_url)
         return cls(
             platform,
@@ -229,7 +432,9 @@ class BrowserPublisher:
                     detail="the browser session is logged out",
                     next_action="Sign in to the configured profile and probe again.",
                 )
-            observed = self.page.text(self._locator("identity")).strip()
+            for purpose in cast(list[str], self._config.get("before_probe", [])):
+                self.page.click(self._locator(purpose))
+            observed = self._observed_identity()
             if not observed:
                 return ProbeResult(
                     authenticated=False,
@@ -277,6 +482,24 @@ class BrowserPublisher:
                 detail="publish metadata requires caption or description text",
                 next_action="Generate and validate the platform metadata pack.",
             )
+        scheduled_at = request.metadata.get("scheduled_at")
+        if scheduled_at is not None:
+            if not self._config.get("supports_schedule", False):
+                return ValidationResult(
+                    ok=False,
+                    error_category=ErrorCategory.CONFIGURATION,
+                    detail=f"{self.platform} browser publishing does not support scheduling",
+                    next_action="Remove scheduled_at or use a scheduling-capable destination.",
+                )
+            try:
+                self._schedule_fields(scheduled_at)
+            except ValueError:
+                return ValidationResult(
+                    ok=False,
+                    error_category=ErrorCategory.VALIDATION,
+                    detail="scheduled_at must be an ISO-8601 date-time",
+                    next_action="Provide a timezone-qualified ISO-8601 schedule timestamp.",
+                )
         return ValidationResult(ok=True)
 
     def publish(self, request: PublishRequest) -> PublishResult:
@@ -323,6 +546,9 @@ class BrowserPublisher:
 
         submit_clicked = False
         try:
+            schedule_requested = bool(request.metadata.get("scheduled_at"))
+            if schedule_requested:
+                self._require_schedule_controls()
             for purpose in cast(list[str], self._config.get("before_upload", [])):
                 self.page.click(self._locator(purpose))
             self.page.set_input_files(self._locator("upload"), request.media_path)
@@ -332,19 +558,39 @@ class BrowserPublisher:
                 else:
                     self.page.click(self._locator(purpose))
             self._apply_metadata(request.metadata)
+            previous_evidence = self._raw_evidence()
+            submit_purpose = "schedule_submit" if schedule_requested else "submit"
             submit_clicked = True
             # Mark the boundary before invoking the browser. A click can reach
             # the platform even when the automation bridge raises afterward.
-            self.page.click(self._locator("submit"))
-            return self._confirmed_result(request, probe.observed_identity)
+            self.page.click(self._locator(submit_purpose))
+            return self._confirmed_result(
+                probe.observed_identity,
+                previous_evidence,
+                schedule_requested=schedule_requested,
+            )
         except Exception as exc:
             if submit_clicked:
                 return self._ambiguous_result(probe.observed_identity)
             return self._failure(exc)
 
+    def _observed_identity(self) -> str:
+        locator = self._locator("identity")
+        for raw_rule in cast(list[dict[str, str]], self._config["identity_evidence"]):
+            if raw_rule["source"] == "attribute":
+                raw = self.page.attribute(locator, raw_rule["attribute"]).strip()
+            else:
+                raw = self.page.text(locator).strip()
+            match = re.search(raw_rule["pattern"], raw, re.IGNORECASE)
+            if not match:
+                continue
+            observed = match.group("identity").strip().lstrip("@").rstrip("/")
+            if observed.casefold() not in _GENERIC_IDENTITIES:
+                return observed
+        return ""
+
     def _apply_metadata(self, metadata: Mapping[str, object]) -> None:
         caption = str(metadata.get("caption", metadata.get("description", "")))
-        self.page.fill(self._locator("caption"), caption)
         if self.platform == "youtube":
             self._fill_if_text("title", metadata.get("title"))
             self._fill_if_text("description", metadata.get("description"))
@@ -361,15 +607,47 @@ class BrowserPublisher:
                     cast(bool, metadata["synthetic_media"]),
                 )
             self._select_if_text("visibility", metadata.get("visibility"))
-            self._fill_if_text("scheduled_at", metadata.get("scheduled_at"))
         elif self.platform == "tiktok":
-            self._fill_if_text("filename_slug", metadata.get("title"))
+            self._fill_if_text("filename_slug", metadata.get("filename_slug"))
+            self.page.fill(self._locator("caption"), caption)
             for key in ("allow_comments", "allow_duet", "allow_stitch"):
                 if isinstance(metadata.get(key), bool):
                     self.page.check(self._locator(key), cast(bool, metadata[key]))
-            self._fill_if_text("scheduled_at", metadata.get("scheduled_at"))
-        elif self.platform == "facebook":
-            self._fill_if_text("scheduled_at", metadata.get("scheduled_at"))
+        else:
+            self.page.fill(self._locator("caption"), caption)
+        if metadata.get("scheduled_at"):
+            schedule_date, schedule_time = self._schedule_fields(
+                metadata["scheduled_at"]
+            )
+            self.page.click(self._locator("schedule_mode"))
+            self.page.fill(self._locator("schedule_date"), schedule_date)
+            self.page.fill(self._locator("schedule_time"), schedule_time)
+
+    def _require_schedule_controls(self) -> None:
+        required = (
+            "schedule_mode",
+            "schedule_date",
+            "schedule_time",
+            "schedule_submit",
+        )
+        missing = [
+            purpose
+            for purpose in required
+            if purpose not in self._locators
+            or not self.page.is_visible(self._locator(purpose))
+        ]
+        if missing:
+            raise BrowserUIError(
+                "scheduling controls are unavailable: " + ", ".join(missing)
+            )
+
+    @staticmethod
+    def _schedule_fields(value: object) -> tuple[str, str]:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("scheduled_at is not text")
+        normalized = value.strip().replace("Z", "+00:00")
+        scheduled = datetime.fromisoformat(normalized)
+        return scheduled.date().isoformat(), scheduled.strftime("%H:%M")
 
     def _fill_if_text(self, purpose: str, value: object) -> None:
         if purpose in self._locators and isinstance(value, str) and value.strip():
@@ -380,43 +658,66 @@ class BrowserPublisher:
             self.page.select_option(self._locator(purpose), value.strip())
 
     def _confirmed_result(
-        self, request: PublishRequest, observed_identity: str
+        self,
+        observed_identity: str,
+        previous: Mapping[str, str],
+        *,
+        schedule_requested: bool,
     ) -> PublishResult:
-        confirmation = ""
+        current = self._raw_evidence()
+        fresh = {
+            key: value
+            for key, value in current.items()
+            if value and value != previous.get(key, "")
+        }
+        confirmation_pattern = cast(
+            str,
+            self._config[
+                "schedule_confirmation_pattern"
+                if schedule_requested
+                else "confirmation_pattern"
+            ],
+        )
+        raw_confirmation = fresh.get("confirmation", "")
+        confirmation = (
+            raw_confirmation
+            if re.search(confirmation_pattern, raw_confirmation, re.IGNORECASE)
+            else ""
+        )
+        post_pattern = cast(str, self._config["post_link_pattern"])
         permalink = ""
-        platform_id = ""
-        confirmation_locator = self._locator("confirmation")
-        if self.page.is_visible(confirmation_locator):
-            confirmation = self.page.text(confirmation_locator).strip()
-        permalink_locator = self._locator("permalink")
-        if self.page.is_visible(permalink_locator):
-            candidate = self.page.attribute(permalink_locator, "href").strip()
-            pattern = cast(str, self._config["post_link_pattern"])
-            if re.fullmatch(pattern, candidate):
+        for key in ("permalink", "current_url"):
+            candidate = fresh.get(key, "")
+            if re.fullmatch(post_pattern, candidate, re.IGNORECASE):
                 permalink = candidate
-        if not permalink:
-            candidate = self.page.current_url().strip()
-            pattern = cast(str, self._config["post_link_pattern"])
-            if re.fullmatch(pattern, candidate):
-                permalink = candidate
-        platform_id_locator = self._locator("platform_id")
-        if self.page.is_visible(platform_id_locator):
-            platform_id = self.page.text(platform_id_locator).strip()
+                break
+        raw_platform_id = fresh.get("platform_id", "")
+        platform_id = (
+            raw_platform_id
+            if re.fullmatch(
+                cast(str, self._config["platform_id_pattern"]),
+                raw_platform_id,
+                re.IGNORECASE,
+            )
+            else ""
+        )
+        # A created URL or object ID does not prove the requested time was
+        # selected. Scheduling succeeds only on fresh schedule-specific text.
+        if schedule_requested and not confirmation:
+            return self._ambiguous_result(observed_identity)
         if not (confirmation or permalink or platform_id):
             return self._ambiguous_result(observed_identity)
 
         lowered_confirmation = confirmation.casefold()
-        schedule_requested = bool(self._config.get("supports_schedule", False)) and bool(
-            request.metadata.get("scheduled_at")
-        )
-        is_scheduled = schedule_requested and "schedul" in lowered_confirmation
         is_submitted = any(
             marker in lowered_confirmation
-            for marker in ("uploading", "processing", "under review", "being published")
-        )
-        explicit_live = any(
-            marker in lowered_confirmation
-            for marker in ("published", "shared", "posted", "was sent")
+            for marker in (
+                "uploading",
+                "being uploaded",
+                "processing",
+                "under review",
+                "being published",
+            )
         )
         evidence: dict[str, object] = {
             "observed_identity": observed_identity,
@@ -432,15 +733,39 @@ class BrowserPublisher:
         return PublishResult(
             status=(
                 PublishStatus.SCHEDULED
-                if is_scheduled
+                if schedule_requested
                 else PublishStatus.SUBMITTED
-                if is_submitted or (schedule_requested and not explicit_live)
+                if is_submitted
+                or (
+                    not confirmation
+                    and self.platform in {"tiktok", "youtube", "facebook"}
+                )
                 else PublishStatus.PUBLISHED
             ),
             platform_id=platform_id,
             post_url=permalink,
             evidence=evidence,
         )
+
+    def _raw_evidence(self) -> dict[str, str]:
+        confirmation = ""
+        confirmation_locator = self._locator("confirmation")
+        if self.page.is_visible(confirmation_locator):
+            confirmation = self.page.text(confirmation_locator).strip()
+        permalink = ""
+        permalink_locator = self._locator("permalink")
+        if self.page.is_visible(permalink_locator):
+            permalink = self.page.attribute(permalink_locator, "href").strip()
+        platform_id = ""
+        platform_id_locator = self._locator("platform_id")
+        if self.page.is_visible(platform_id_locator):
+            platform_id = self.page.text(platform_id_locator).strip()
+        return {
+            "confirmation": confirmation,
+            "permalink": permalink,
+            "platform_id": platform_id,
+            "current_url": self.page.current_url().strip(),
+        }
 
     def _ambiguous_result(self, observed_identity: str) -> PublishResult:
         return PublishResult(
@@ -469,12 +794,27 @@ class BrowserPublisher:
         )
 
     def _failure(self, exc: Exception) -> PublishResult:
-        error = normalize_adapter_error(exc)
+        if isinstance(exc, BrowserDependencyError):
+            category = ErrorCategory.DEPENDENCY
+            detail = str(exc)
+            next_action = "Install the browser dependency group and retry the probe."
+            retry_safe = False
+        elif isinstance(exc, BrowserUIError):
+            category = ErrorCategory.PLATFORM_UI
+            detail = str(exc)
+            next_action = "Refresh the platform selector contract before retrying."
+            retry_safe = False
+        else:
+            error = normalize_adapter_error(exc)
+            category = error.category
+            detail = error.detail
+            next_action = error.next_action
+            retry_safe = error.retryable
         return PublishResult(
             status=PublishStatus.FAILED,
-            error_category=error.category.value,
-            detail=error.detail,
-            evidence={"next_action": error.next_action, "retry_safe": error.retryable},
+            error_category=category.value,
+            detail=detail,
+            evidence={"next_action": next_action, "retry_safe": retry_safe},
         )
 
     def _locator(self, purpose: str) -> Locator:
@@ -495,3 +835,28 @@ def register_browser_adapters(
     )
     for platform in SUPPORTED_PLATFORMS:
         registry.register(BrowserPublisher(platform, page_factory(platform), selector_data))
+
+
+def register_managed_chrome_adapters(
+    registry: AdapterRegistry,
+    chrome: ManagedChrome,
+    selectors: Mapping[str, object] | None = None,
+    *,
+    connector: Callable[[str], BrowserPage] | None = None,
+) -> None:
+    """Attach and register all six browser adapters against one managed CDP run."""
+
+    selector_data = (
+        _validate_selector_data(dict(selectors))
+        if selectors is not None
+        else load_browser_selectors()
+    )
+    for platform in SUPPORTED_PLATFORMS:
+        registry.register(
+            BrowserPublisher.from_managed_chrome(
+                platform,
+                chrome,
+                connector,
+                selector_data,
+            )
+        )
