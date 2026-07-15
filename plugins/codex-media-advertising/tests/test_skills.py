@@ -115,6 +115,9 @@ def test_installation_documents_speech_dependency() -> None:
     assert "Systran/faster-distil-whisper-small.en" in text
     assert '"provider": "speaches"' in text
     assert '"endpoint": "http://127.0.0.1:8000/v1/audio/speech"' in text
+    assert 'export UV_CACHE_DIR="$INSTALL_ROOT/speech/cache/uv"' in text
+    assert 'export UV_PYTHON_INSTALL_DIR="$INSTALL_ROOT/speech/python"' in text
+    assert 'export HF_HOME="$INSTALL_ROOT/speech/cache/huggingface"' in text
 
 
 def test_skill_sibling_references_are_plugin_root_relative() -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import stat
 import subprocess
@@ -263,6 +264,26 @@ def test_speech_installer_rejects_symlinked_speaches_destination(
     assert "symlink" in result.stderr
 
 
+def test_speech_installer_rejects_symlinked_uv_cache(
+    tmp_path: Path, plugin_root: Path
+) -> None:
+    install_root = tmp_path / "install"
+    cache_root = install_root / "speech" / "cache"
+    cache_root.mkdir(parents=True)
+    actual = tmp_path / "shared-uv-cache"
+    actual.mkdir()
+    (cache_root / "uv").symlink_to(actual, target_is_directory=True)
+
+    result = _run_installer(
+        plugin_root,
+        plugin_root / "dependencies/speech.lock.json",
+        install_root,
+    )
+
+    assert result.returncode == 2
+    assert "symlink" in result.stderr
+
+
 def test_speech_installer_clones_and_checks_out_exact_revision_when_absent(
     tmp_path: Path,
     plugin_root: Path,
@@ -320,6 +341,20 @@ def test_speech_installer_clones_and_checks_out_exact_revision_when_absent(
         "text": True,
     }
     assert calls[6][1]["cwd"] == source
+    expected_uv_paths = {
+        "UV_CACHE_DIR": str(install_root / "speech" / "cache" / "uv"),
+        "UV_PYTHON_INSTALL_DIR": str(install_root / "speech" / "python"),
+    }
+    for index in (5, 6):
+        environment = calls[index][1]["env"]
+        assert isinstance(environment, dict)
+        assert environment["PATH"] == os.environ["PATH"]
+        for name, path in expected_uv_paths.items():
+            assert environment[name] == path
+    for path in expected_uv_paths.values():
+        directory = Path(path)
+        assert directory.is_dir()
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
 
 
 @pytest.mark.parametrize("precreate_mode", [None, 0o755])

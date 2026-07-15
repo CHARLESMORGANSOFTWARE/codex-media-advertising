@@ -38,8 +38,12 @@ provider; the media pipeline, commands, and other provider options are
 unchanged. Start the loopback-only service in a separate terminal:
 
 ```bash
-cd "$HOME/.local/share/codex-media-ads/speech/speaches"
-"$HOME/.local/share/codex-media-ads/venv/bin/uv" run uvicorn --factory \
+INSTALL_ROOT="${CODEX_MEDIA_ADS_INSTALL_ROOT:-$HOME/.local/share/codex-media-ads}"
+export UV_CACHE_DIR="$INSTALL_ROOT/speech/cache/uv"
+export UV_PYTHON_INSTALL_DIR="$INSTALL_ROOT/speech/python"
+export HF_HOME="$INSTALL_ROOT/speech/cache/huggingface"
+cd "$INSTALL_ROOT/speech/speaches"
+"$INSTALL_ROOT/venv/bin/uv" run uvicorn --factory \
   --host 127.0.0.1 --port 8000 speaches.main:create_app
 ```
 
@@ -57,11 +61,13 @@ configuration:
 }
 ```
 
-On first use, Speaches downloads models into its private cache. The pinned
-`speaches-ai/Kokoro-82M-v1.0-ONNX` model creates narration, while
-`Systran/faster-distil-whisper-small.en` provides transcription. Model caches,
-the installed checkout and environment, and generated audio are runtime data;
-keep them outside this Git checkout and release archives.
+The exported uv directories keep its cache and managed Python under the private
+install root. On first use, Speaches downloads models into the exported
+`HF_HOME` cache there. The pinned `speaches-ai/Kokoro-82M-v1.0-ONNX` model
+creates narration, while `Systran/faster-distil-whisper-small.en` provides
+transcription. Model caches, the installed checkout and environment, and
+generated audio are runtime data; keep them outside this Git checkout and
+release archives.
 
 With the service running and that runtime configuration selected, validate it
 before creating video:

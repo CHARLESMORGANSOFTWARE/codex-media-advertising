@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -87,10 +88,28 @@ def _uv_executable() -> str:
     return str(Path(sysconfig.get_path("scripts")) / "uv")
 
 
+def _uv_environment(install_root: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "UV_CACHE_DIR": str(install_root / "speech" / "cache" / "uv"),
+            "UV_PYTHON_INSTALL_DIR": str(install_root / "speech" / "python"),
+        }
+    )
+    return environment
+
+
 def validate_managed_paths(install_root: Path) -> None:
     speech_root = install_root / "speech"
     source = speech_root / "speaches"
-    for path in (speech_root, source):
+    cache_root = speech_root / "cache"
+    for path in (
+        speech_root,
+        source,
+        cache_root,
+        cache_root / "uv",
+        speech_root / "python",
+    ):
         if path.is_symlink():
             raise SpeechInstallError(
                 f"unsafe install root: managed path is a symlink: {path}"
@@ -101,13 +120,21 @@ def validate_managed_paths(install_root: Path) -> None:
             )
 
 
-def _ensure_private_install_root(install_root: Path) -> None:
-    install_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if not install_root.is_dir():
-        raise SpeechInstallError("unsafe install root: path is not a directory")
-    install_root.chmod(0o700)
-    if stat.S_IMODE(install_root.stat().st_mode) != 0o700:
-        raise SpeechInstallError("unsafe install root: mode must be 0700")
+def _ensure_private_directory(path: Path) -> None:
+    if path.is_symlink():
+        raise SpeechInstallError(
+            f"unsafe install root: managed path is a symlink: {path}"
+        )
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not path.is_dir():
+        raise SpeechInstallError(
+            f"unsafe install root: managed path is not a directory: {path}"
+        )
+    path.chmod(0o700)
+    if stat.S_IMODE(path.stat().st_mode) != 0o700:
+        raise SpeechInstallError(
+            f"unsafe install root: managed path mode must be 0700: {path}"
+        )
 
 
 def build_plan(
@@ -115,10 +142,16 @@ def build_plan(
 ) -> list[tuple[list[str], Path | None]]:
     source_parent = install_root / "speech"
     source = source_parent / "speaches"
+    cache_root = source_parent / "cache"
+    uv_cache = cache_root / "uv"
+    python_install = source_parent / "python"
     revision = lock["git_revision"]
     plan: list[tuple[list[str], Path | None]] = [
         (["mkdir", "-m", "0700", "-p", str(install_root)], None),
-        (["mkdir", "-p", str(source_parent)], None),
+        (["mkdir", "-m", "0700", "-p", str(source_parent)], None),
+        (["mkdir", "-m", "0700", "-p", str(cache_root)], None),
+        (["mkdir", "-m", "0700", "-p", str(uv_cache)], None),
+        (["mkdir", "-m", "0700", "-p", str(python_install)], None),
         (
             [
                 sys.executable,
@@ -174,18 +207,22 @@ def print_plan(plan: list[tuple[list[str], Path | None]]) -> None:
 
 
 def execute_plan(
-    plan: list[tuple[list[str], Path | None]], revision: str, git_url: str
+    plan: list[tuple[list[str], Path | None]],
+    revision: str,
+    git_url: str,
+    install_root: Path,
 ) -> None:
+    uv_executable = _uv_executable()
+    uv_environment = _uv_environment(install_root)
     for command, cwd in plan:
         if command[:4] == ["mkdir", "-m", "0700", "-p"]:
-            _ensure_private_install_root(Path(command[4]))
-            continue
-        if command[:2] == ["mkdir", "-p"]:
-            Path(command[2]).mkdir(parents=True, exist_ok=True)
+            _ensure_private_directory(Path(command[4]))
             continue
         kwargs: dict[str, object] = {"check": True}
         if cwd is not None:
             kwargs["cwd"] = cwd
+        if command[0] == uv_executable and command[1] in {"python", "sync"}:
+            kwargs["env"] = uv_environment
         if command == ["git", "remote", "get-url", "origin"]:
             kwargs.update({"capture_output": True, "text": True})
             completed = subprocess.run(command, **kwargs)
@@ -237,7 +274,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.dry_run:
             print_plan(plan)
             return 0
-        execute_plan(plan, lock["git_revision"], lock["git_url"])
+        execute_plan(plan, lock["git_revision"], lock["git_url"], install_root)
         return 0
     except subprocess.CalledProcessError as exc:
         print(
