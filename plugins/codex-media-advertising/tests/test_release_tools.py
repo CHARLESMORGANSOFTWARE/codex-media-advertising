@@ -57,6 +57,74 @@ def test_release_scanner_rejects_nested_receipt_members(tmp_path: Path) -> None:
     assert any("archive/receipts/foo.json" in finding for finding in findings)
 
 
+@pytest.mark.parametrize(
+    ("relative", "data"),
+    [
+        ("speech/speaches/speaches/main.py", b"source"),
+        ("speech/speaches/.venv/bin/python", b"managed-python"),
+        ("model-cache/index.json", b"{}"),
+        ("artifacts/kokoro.onnx", b"model"),
+        ("artifacts/narration.wav", b"audio"),
+    ],
+)
+def test_release_scanner_rejects_speech_runtime_from_tracked_files(
+    tmp_path: Path, relative: str, data: bytes
+) -> None:
+    scanner = _load_script("scan_release")
+    artifact = tmp_path / relative
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(data)
+
+    findings = scanner.scan_path(tmp_path)
+
+    assert any(relative in finding for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "speech/speaches/speaches/main.py",
+        "speech/speaches/.venv/bin/python",
+        "model-cache/index.json",
+        "artifacts/kokoro.onnx",
+        "artifacts/narration.wav",
+    ],
+)
+def test_release_scanner_rejects_speech_runtime_from_archives(
+    tmp_path: Path, relative: str
+) -> None:
+    scanner = _load_script("scan_release")
+    archive = tmp_path / "release.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr(relative, b"runtime-data")
+
+    findings = scanner.scan_path(archive)
+
+    assert any(relative in finding for finding in findings)
+
+
+def test_release_scanner_allows_speech_lock_and_documentation_references(
+    tmp_path: Path,
+) -> None:
+    scanner = _load_script("scan_release")
+    lock = tmp_path / "plugins/codex-media-advertising/dependencies/speech.lock.json"
+    lock.parent.mkdir(parents=True)
+    lock.write_text(
+        '{"tts_model":"speaches-ai/Kokoro-82M-v1.0-ONNX",'
+        '"stt_model":"Systran/faster-distil-whisper-small.en"}\n',
+        encoding="utf-8",
+    )
+    docs = tmp_path / "plugins/codex-media-advertising/docs/installation.md"
+    docs.parent.mkdir(parents=True)
+    docs.write_text(
+        "Keep speech/speaches/.venv, model-cache/kokoro.onnx, and generated.wav "
+        "out of releases.\n",
+        encoding="utf-8",
+    )
+
+    assert scanner.scan_path(tmp_path) == []
+
+
 def test_build_release_rejects_tracked_symlinks(tmp_path: Path, monkeypatch) -> None:
     builder = _load_script("build_release")
     source = tmp_path / "repo"

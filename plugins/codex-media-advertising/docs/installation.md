@@ -29,10 +29,54 @@ YouTube API route:
   "./plugins/codex-media-advertising[browser,youtube]"
 ```
 
-FFmpeg/ffprobe, Chrome/Chromium, and the Codimage and narration providers are
-external prerequisites checked by `codex-media-ads setup`. The installer leaves
-all runtime state outside the checkout. It does not create credentials, launch
-jobs, or publish anything.
+## Start the managed local speech dependency
+
+The installer checks out the pinned Speaches dependency to
+`$HOME/.local/share/codex-media-ads/speech/speaches` and installs its locked
+environment with `uv`. This is an add-on for the existing `speaches` narration
+provider; the media pipeline, commands, and other provider options are
+unchanged. Start the loopback-only service in a separate terminal:
+
+```bash
+cd "$HOME/.local/share/codex-media-ads/speech/speaches"
+"$HOME/.local/share/codex-media-ads/venv/bin/uv" run uvicorn --factory \
+  --host 127.0.0.1 --port 8000 speaches.main:create_app
+```
+
+Put this fragment inside the `creative` object in your nonsecret runtime
+configuration:
+
+```json
+{
+  "narration": {
+    "provider": "speaches",
+    "endpoint": "http://127.0.0.1:8000/v1/audio/speech",
+    "model": "speaches-ai/Kokoro-82M-v1.0-ONNX"
+  },
+  "voice": "af_heart"
+}
+```
+
+On first use, Speaches downloads models into its private cache. The pinned
+`speaches-ai/Kokoro-82M-v1.0-ONNX` model creates narration, while
+`Systran/faster-distil-whisper-small.en` provides transcription. Model caches,
+the installed checkout and environment, and generated audio are runtime data;
+keep them outside this Git checkout and release archives.
+
+With the service running and that runtime configuration selected, validate it
+before creating video:
+
+```bash
+codex-media-ads setup --format json
+```
+
+The JSON must report `narration_provider` with status `ok`. Treat `missing` or
+`blocked` as a stop, resolve the reported action, and rerun the same validation.
+
+FFmpeg/ffprobe, Chrome/Chromium, and Codimage remain external prerequisites
+checked by `codex-media-ads setup`. The installer leaves all runtime state
+outside the checkout. It does not create credentials, launch services or jobs,
+or publish anything.
 
 ## First setup
 

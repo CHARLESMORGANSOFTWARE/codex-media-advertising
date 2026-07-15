@@ -31,6 +31,8 @@ _SECRET_ASSIGN_RE = re.compile(
     re.IGNORECASE,
 )
 _PRIVATE_DIRECTORY_NAMES = {
+    ".cache",
+    ".venv",
     "browser-profile",
     "browser-profiles",
     "browser_profile",
@@ -38,6 +40,8 @@ _PRIVATE_DIRECTORY_NAMES = {
     "generated",
     "log",
     "logs",
+    "model-cache",
+    "model_cache",
     "queue",
     "queues",
     "receipt",
@@ -48,7 +52,32 @@ _PRIVATE_FILENAME_RE = re.compile(
     re.IGNORECASE,
 )
 _PRIVATE_DATA_SUFFIXES = {".json", ".jsonl", ".log", ".db", ".sqlite", ".sqlite3"}
-_MEDIA_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm", ".wav", ".mp3", ".png", ".jpg", ".jpeg"}
+_MEDIA_SUFFIXES = {
+    ".aac",
+    ".flac",
+    ".m4a",
+    ".m4v",
+    ".mov",
+    ".mp3",
+    ".mp4",
+    ".ogg",
+    ".opus",
+    ".wav",
+    ".webm",
+    ".jpeg",
+    ".jpg",
+    ".png",
+}
+_MODEL_SUFFIXES = {
+    ".bin",
+    ".ckpt",
+    ".ggml",
+    ".gguf",
+    ".onnx",
+    ".pt",
+    ".pth",
+    ".safetensors",
+}
 _ALLOWED_MEDIA = {
     "plugins/codex-media-advertising/tests/fixtures/synthetic.png",
     "plugins/codex-media-advertising/.codex-plugin/icon.svg",
@@ -143,6 +172,7 @@ def _scan_member(relative: str, data: bytes) -> list[str]:
     findings: list[str] = []
     normalized = _posix(relative)
     parts = PurePosixPath(normalized).parts
+    lowered_parts = tuple(part.casefold() for part in parts)
     parent_parts = {part.casefold() for part in parts[:-1]}
     filename = parts[-1] if parts else normalized
     filename_lower = filename.casefold()
@@ -156,9 +186,18 @@ def _scan_member(relative: str, data: bytes) -> list[str]:
         private_path = True
     if private_path and not normalized.endswith("/receipts.py"):
         findings.append(f"{normalized}: private artifact filename")
+    if any(
+        lowered_parts[index : index + 2] == ("speech", "speaches")
+        for index in range(len(lowered_parts) - 1)
+    ):
+        findings.append(
+            f"{normalized}: managed speech checkout is not allowed in a release"
+        )
     suffix = PurePosixPath(normalized).suffix.lower()
     if suffix in _MEDIA_SUFFIXES and normalized not in _ALLOWED_MEDIA:
         findings.append(f"{normalized}: generated media is not allowlisted")
+    if suffix in _MODEL_SUFFIXES:
+        findings.append(f"{normalized}: model binary is not allowed in a release")
     # Provider stand-ins and focused safety tests intentionally contain fake
     # credentials or canonical paths. These named files are the only test
     # allowlist; every other test is scanned like production code.

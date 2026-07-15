@@ -18,22 +18,28 @@ never put secrets in a campaign file, prompt, checkout, or receipt summary.
 
 ## Safe sequence
 
-1. Check the installation and private-state prerequisites. Use
+1. If using the managed local Speaches add-on, follow the exact start command
+   in `../../docs/installation.md`, keep it bound to `127.0.0.1:8000`, and
+   configure the existing `speaches` provider endpoint as
+   `http://127.0.0.1:8000/v1/audio/speech`. Kokoro creates narration and Whisper
+   provides transcription; first use downloads both models to private cache.
+2. Check the installation and private-state prerequisites. Use
    `codex-media-ads setup --format json` and report every check, including
-   missing optional browser/API dependencies.
-2. Import a user-provided credential only with
+   missing optional browser/API dependencies. Before video creation,
+   `narration_provider` must be `ok`; `missing` or `blocked` is a stop.
+3. Import a user-provided credential only with
    `codex-media-ads setup --import-secret NAME=PATH --format json`. Never print
    the file contents. The command must reject symlinks and non-owner-only paths.
-3. Write only nonsecret channel configuration (expected identity and route) to a
+4. Write only nonsecret channel configuration (expected identity and route) to a
    user-owned JSON file, then run `codex-media-ads setup --config PATH
    --format json`.
-4. Probe each enabled destination with
+5. Probe each enabled destination with
    `codex-media-ads publish probe --platform PLATFORM --format json`. An exact
    identity match is required; record the observed identity privately.
-5. Enable a destination only after setup reports dependency checks, synthetic
+6. Enable a destination only after setup reports dependency checks, synthetic
    render/narration checks, identity probe, and a final-action-skipping dry run
    as `ok`. Use `codex-media-ads setup --enable PLATFORM --config PATH`.
-6. Install a scheduler only after setup has persisted background-enabled channels
+7. Install a scheduler only after setup has persisted background-enabled channels
    for the requested background automation:
    `codex-media-ads automation install daily-short --hour 9 --minute 0`.
 

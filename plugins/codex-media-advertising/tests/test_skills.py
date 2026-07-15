@@ -106,6 +106,17 @@ def test_installation_docs_use_public_marketplace_commands_and_accurate_extras()
     assert "optional local dependencies available on the machine" not in text
 
 
+def test_installation_documents_speech_dependency() -> None:
+    text = (PLUGIN / "docs" / "installation.md").read_text()
+
+    assert "speech/speaches" in text
+    assert "127.0.0.1:8000" in text
+    assert "speaches-ai/Kokoro-82M-v1.0-ONNX" in text
+    assert "Systran/faster-distil-whisper-small.en" in text
+    assert '"provider": "speaches"' in text
+    assert '"endpoint": "http://127.0.0.1:8000/v1/audio/speech"' in text
+
+
 def test_skill_sibling_references_are_plugin_root_relative() -> None:
     for name in SKILL_NAMES:
         text = (PLUGIN / "skills" / name / "SKILL.md").read_text()

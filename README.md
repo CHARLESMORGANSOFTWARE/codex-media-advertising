@@ -28,6 +28,12 @@ codex plugin add codex-media-advertising@personal
 ./plugins/codex-media-advertising/scripts/install.sh
 ```
 
+The installer adds the pinned local Speaches/Whisper dependency under
+`$HOME/.local/share/codex-media-ads/speech/speaches`; it does not replace the
+existing media pipeline or provider interface. Start that local service and
+select the existing `speaches` narration provider by following
+[`docs/installation.md`](plugins/codex-media-advertising/docs/installation.md).
+
 Start a new Codex task and use `$media-onboarding` to connect providers and
 social accounts. Install `[browser,youtube]` extras when those routes are
 needed; the installer never creates credentials or publishes content.

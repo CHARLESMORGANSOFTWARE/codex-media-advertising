@@ -46,3 +46,13 @@ The command copies the credential into private state without printing it and
 returns only a redacted destination. If import fails, fix ownership or
 permissions; never weaken the secret file mode or replace the path with a
 symlink.
+
+## Local speech service
+
+The managed Speaches service does not require a platform credential when it is
+bound to `127.0.0.1:8000`. Keep it on loopback, use
+`http://127.0.0.1:8000/v1/audio/speech` as the existing narration provider
+endpoint, and do not expose it as a remote authentication substitute. Speaches
+downloads Kokoro and Whisper models to private runtime cache on first use;
+never copy that cache, the installed `speech/speaches` checkout, its `.venv`,
+or generated audio into configuration, Git, or a release archive.
