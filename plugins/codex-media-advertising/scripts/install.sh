@@ -21,6 +21,11 @@ if [ "$#" -ne 0 ]; then
     exit 2
 fi
 
+"$PYTHON_BIN" "$PLUGIN_ROOT/scripts/install_speech.py" \
+    --lock "$PLUGIN_ROOT/dependencies/speech.lock.json" \
+    --install-root "$INSTALL_ROOT" \
+    --validate-only
+
 print_command() {
     printf 'dry-run:'
     for argument in "$@"; do

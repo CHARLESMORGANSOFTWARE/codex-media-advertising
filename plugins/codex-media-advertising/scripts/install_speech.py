@@ -30,6 +30,10 @@ class SpeechInstallError(ValueError):
     """Raised when the speech dependency cannot be installed safely."""
 
 
+def _is_same_or_descendant(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
 def load_lock(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text())
@@ -49,7 +53,7 @@ def load_lock(path: Path) -> dict[str, Any]:
     return payload
 
 
-def validate_install_root(raw_path: str) -> Path:
+def validate_install_root(raw_path: str, plugin_root: Path) -> Path:
     if not raw_path:
         raise SpeechInstallError("unsafe install root: path is empty")
     path = Path(raw_path)
@@ -62,6 +66,15 @@ def validate_install_root(raw_path: str) -> Path:
         for component in raw_path.split("/")[1:]
     ):
         raise SpeechInstallError("unsafe install root: path is not lexical")
+    lexical_plugin_root = plugin_root.absolute()
+    canonical_plugin_root = plugin_root.resolve(strict=True)
+    canonical_path = path.resolve(strict=False)
+    if _is_same_or_descendant(
+        path, lexical_plugin_root
+    ) or _is_same_or_descendant(canonical_path, canonical_plugin_root):
+        raise SpeechInstallError(
+            "unsafe install root: path must be outside the plugin checkout"
+        )
     for component in (path, *path.parents):
         if component.is_symlink():
             raise SpeechInstallError(
@@ -207,6 +220,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lock", required=True, type=Path)
     parser.add_argument("--install-root", required=True)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--validate-only", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 
@@ -214,8 +228,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         lock = load_lock(args.lock)
-        install_root = validate_install_root(args.install_root)
+        plugin_root = Path(__file__).resolve().parents[1]
+        install_root = validate_install_root(args.install_root, plugin_root)
         validate_managed_paths(install_root)
+        if args.validate_only:
+            return 0
         plan = build_plan(lock, install_root)
         if args.dry_run:
             print_plan(plan)

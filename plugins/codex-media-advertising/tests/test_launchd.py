@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import plistlib
+import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -431,6 +433,99 @@ def test_install_dry_run_prints_speech_handoff_without_writing(
     assert not (home / "Library" / "LaunchAgents").exists()
 
 
+@pytest.mark.parametrize("location", ["checkout", "descendant", "symlink-alias"])
+def test_install_dry_run_rejects_checkout_install_root_override(
+    tmp_path: Path, location: str
+) -> None:
+    script = Path(__file__).parents[1] / "scripts" / "install.sh"
+    plugin_root = script.parent.parent
+    if location == "checkout":
+        install_root = plugin_root
+    elif location == "descendant":
+        install_root = plugin_root / "checkout-contained-install"
+    else:
+        plugin_alias = tmp_path / "plugin-alias"
+        plugin_alias.symlink_to(plugin_root, target_is_directory=True)
+        install_root = plugin_alias / "checkout-contained-install"
+    state_root = tmp_path / "state"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "CODEX_MEDIA_ADS_INSTALL_ROOT": str(install_root),
+            "CODEX_MEDIA_ADS_STATE_ROOT": str(state_root),
+            "PYTHON_BIN": sys.executable,
+        }
+    )
+
+    result = subprocess.run(
+        ["/bin/sh", str(script), "--dry-run"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "plugin checkout" in result.stderr
+    assert not state_root.exists()
+    if location != "checkout":
+        assert not install_root.exists()
+
+
+def test_install_rejects_checkout_root_before_any_mutation(tmp_path: Path) -> None:
+    source_root = Path(__file__).parents[1]
+    plugin_root = tmp_path / "plugin"
+    scripts = plugin_root / "scripts"
+    dependencies = plugin_root / "dependencies"
+    scripts.mkdir(parents=True)
+    dependencies.mkdir()
+    shutil.copy2(source_root / "scripts/install.sh", scripts / "install.sh")
+    shutil.copy2(
+        source_root / "scripts/install_speech.py", scripts / "install_speech.py"
+    )
+    shutil.copy2(
+        source_root / "dependencies/speech.lock.json",
+        dependencies / "speech.lock.json",
+    )
+    plugin_root.chmod(0o755)
+
+    marker = tmp_path / "base-install-started"
+    fake_python = tmp_path / "python3"
+    helper = scripts / "install_speech.py"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        f"if [ \"${{1:-}}\" = {shlex.quote(str(helper))} ]; then\n"
+        f"    exec {shlex.quote(sys.executable)} \"$@\"\n"
+        "fi\n"
+        f"touch {shlex.quote(str(marker))}\n"
+        "exit 97\n"
+    )
+    fake_python.chmod(0o700)
+    state_root = tmp_path / "state"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "CODEX_MEDIA_ADS_INSTALL_ROOT": str(plugin_root),
+            "CODEX_MEDIA_ADS_STATE_ROOT": str(state_root),
+            "PYTHON_BIN": str(fake_python),
+        }
+    )
+
+    result = subprocess.run(
+        ["/bin/sh", str(scripts / "install.sh")],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "plugin checkout" in result.stderr
+    assert not marker.exists()
+    assert not state_root.exists()
+    assert plugin_root.stat().st_mode & 0o777 == 0o755
+
+
 def test_install_invokes_speech_helper_after_base_package_install(
     tmp_path: Path,
 ) -> None:
@@ -472,6 +567,11 @@ def test_install_invokes_speech_helper_after_base_package_install(
     assert result.returncode == 0
     calls = calls_path.read_text().splitlines()
     assert calls == [
+        (
+            f"{plugin_root}/scripts/install_speech.py "
+            f"--lock {plugin_root}/dependencies/speech.lock.json "
+            f"--install-root {install_root} --validate-only"
+        ),
         f"-m venv {install_root}/venv",
         f"-m pip install --upgrade {plugin_root}",
         (

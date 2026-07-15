@@ -203,6 +203,46 @@ def test_speech_installer_rejects_symlinked_install_root(
     assert not install_root.exists()
 
 
+@pytest.mark.parametrize("location", ["checkout", "descendant"])
+def test_speech_installer_rejects_install_root_inside_plugin_checkout(
+    plugin_root: Path, location: str
+) -> None:
+    install_root = (
+        plugin_root
+        if location == "checkout"
+        else plugin_root / "checkout-contained-install"
+    )
+
+    result = _run_installer(
+        plugin_root,
+        plugin_root / "dependencies/speech.lock.json",
+        install_root,
+    )
+
+    assert result.returncode == 2
+    assert "plugin checkout" in result.stderr
+    if location == "descendant":
+        assert not install_root.exists()
+
+
+def test_speech_installer_rejects_symlink_alias_into_plugin_checkout(
+    tmp_path: Path, plugin_root: Path
+) -> None:
+    plugin_alias = tmp_path / "plugin-alias"
+    plugin_alias.symlink_to(plugin_root, target_is_directory=True)
+    install_root = plugin_alias / "checkout-contained-install"
+
+    result = _run_installer(
+        plugin_root,
+        plugin_root / "dependencies/speech.lock.json",
+        install_root,
+    )
+
+    assert result.returncode == 2
+    assert "plugin checkout" in result.stderr
+    assert not install_root.exists()
+
+
 def test_speech_installer_rejects_symlinked_speaches_destination(
     tmp_path: Path, plugin_root: Path
 ) -> None:
