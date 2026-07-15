@@ -133,6 +133,7 @@ def campaign() -> CampaignManifest:
 
 @pytest.fixture
 def orchestrator(tmp_path: Path):
+    now = datetime(2026, 7, 14, 12, tzinfo=timezone.utc)
     adapters = {platform: FakeAdapter(platform) for platform in PLATFORMS}
     accounts = {
         platform: AccountConfig(
@@ -143,12 +144,12 @@ def orchestrator(tmp_path: Path):
     }
     router = FakeRouter(adapters)
     service = Orchestrator(
-        queue_store=QueueStore(tmp_path / "state"),
+        queue_store=QueueStore(tmp_path / "state", clock=lambda: now),
         router=router,
         adapters=adapters,
         accounts=accounts,
         builder=FakeBuilder(tmp_path / "generated"),
-        clock=lambda: datetime(2026, 7, 14, 12, tzinfo=timezone.utc),
+        clock=lambda: now,
         daily_cap=20,
         retry_limit=1,
         failure_pause_threshold=2,
